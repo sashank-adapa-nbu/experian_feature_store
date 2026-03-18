@@ -32,6 +32,7 @@
 #     orig_loan_am is null, as CC products report limit not disbursed amount
 # =============================================================================
 
+from features.tradeline.grp04_bureau_vintage import SECURED_CODES
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from typing import List
@@ -59,10 +60,17 @@ USL_CODES = {
     "227", "226", "249",
 }
 
-PL_CODE   = "123"
-STPL_CODE = "242"
+PL_CODE       = "123"
+STPL_CODE     = "242"
+CONSUMER_CODE = "189"  
 
-ALL_NAMED_CODES = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES
+SECURED_CODES = {
+    "47", "58", "195", "168", "220", "173", "221",
+    "175", "222", "172", "219", "184", "185", "191",
+    "223", "243", "241",
+}
+
+ALL_NAMED_CODES = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES | SECURED_CODES
 
 
 

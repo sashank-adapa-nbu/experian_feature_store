@@ -1,16 +1,6 @@
 # features/tradeline/grp01_portfolio_counts.py
 # =============================================================================
-# Group 01 — Portfolio Counts & Active Portfolio
-# =============================================================================
-# Merged from: cat01, cat02, cat19 (count/flag/segment components)
-#
-# Sections:
-#   A. Tradeline opened counts (windowed, by product, by amount)
-#   B. Active portfolio counts by product type
-#   C. Bureau segment labels (thickness, cohort)
-#
-# Redundancy removed:
-#   CountBureauActiveAccounts (cat01) == active_loans (cat02) → removed cat01 version
+# Group 01 — Portfolio Counts & Active Portfolio & Bureau Segments
 # =============================================================================
 
 from pyspark.sql import DataFrame
@@ -48,20 +38,17 @@ UNSECURED_EXCLUDE = {
     "175", "222", "172", "219", "184", "185", "191", "223",
 }
 
-SECURED_CODES = {
-    "47", "58", "195", "168", "220", "173", "221",
-    "175", "222", "172", "219", "184", "185", "191",
-    "223", "243", "241",
-}
+
+def _i(cond):
+    """Convert any condition/column to int 0/1 for safe summing."""
+    return F.when(cond, F.lit(1)).otherwise(F.lit(0))
 
 
 class PortfolioCountsFeatures(TradelineFeatureBase):
     """
     Group 01: Portfolio Counts & Active Portfolio & Bureau Segments
-
-    A. Tradeline counts — opened within windows, by product/amount
-    B. Active portfolio counts — by product group (cat02)
-    C. Bureau segment labels — pl_thickness, cc_thickness, bureaage, bur_cohort
+    All flags stored as BOOLEAN internally.
+    Aggregations use _i(flag) to convert to int only at sum time.
     """
 
     CATEGORY = "grp01_portfolio_counts"
@@ -84,7 +71,7 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             .withColumn("_as_of_dt",  parse_date(as_of_col))
         )
 
-        # Months since open — NULL for future accounts
+        # Months since open
         df = df.withColumn(
             "_months_since_open",
             F.when(F.col("_open_dt") <= F.col("_as_of_dt"),
@@ -92,7 +79,7 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
              .otherwise(F.lit(None).cast("double"))
         )
 
-        # Bureau age (for segments)
+        # Bureau age — same as months_since_open (max gives oldest account age)
         df = df.withColumn(
             "_age_months",
             F.when(F.col("_open_dt") <= F.col("_as_of_dt"),
@@ -100,36 +87,37 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
              .otherwise(F.lit(None).cast("double"))
         )
 
-        # Active flag — point-in-time
-        df = df.withColumn(
-            "_is_active",
-            F.when(
-                (F.col("_open_dt") <= F.col("_as_of_dt")) &
-                (F.col("_closed_dt").isNull() | (F.col("_closed_dt") > F.col("_as_of_dt"))),
-                F.lit(1)
-            ).otherwise(F.lit(0))
-        )
-
-        # Clean loan amount
+        # Clean loan amount — cast string to double
         df = df.withColumn(
             "_loan_am",
-            F.when(F.col("orig_loan_am").cast("double") > 0, F.col("orig_loan_am").cast("double"))
-             .otherwise(F.lit(None))
+            F.when(
+                F.col("orig_loan_am").isNotNull() &
+                (F.col("orig_loan_am").cast("double") > 0),
+                F.col("orig_loan_am").cast("double")
+            ).otherwise(F.lit(None).cast("double"))
         )
 
         df = df.withColumn("_acct", F.trim(F.col("acct_type_cd").cast("string")))
 
-        # Window flags
+        # ── ALL FLAGS AS BOOLEAN ──────────────────────────────────────────────
+        # Active flag (boolean)
+        df = df.withColumn(
+            "_active",
+            (F.col("_open_dt") <= F.col("_as_of_dt")) &
+            (F.col("_closed_dt").isNull() | (F.col("_closed_dt") > F.col("_as_of_dt")))
+        )
+
+        # Window flags (boolean)
         df = (
             df
-            .withColumn("_in_6m",  F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 6))
-            .withColumn("_in_12m", F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 12))
-            .withColumn("_in_24m", F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 24))
-            .withColumn("_in_36m", F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 36))
+            .withColumn("_in_6m",    F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 6))
+            .withColumn("_in_12m",   F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 12))
+            .withColumn("_in_24m",   F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 24))
+            .withColumn("_in_36m",   F.col("_months_since_open").isNotNull() & (F.col("_months_since_open") <= 36))
             .withColumn("_eligible", F.col("_months_since_open").isNotNull())
         )
 
-        # Product flags — all BOOLEAN (booleans work fine in F.when conditions & &/|)
+        # Product flags (boolean — all consistent, no int mixing)
         df = (
             df
             .withColumn("_is_pl",        F.col("_acct") == PL_CODE)
@@ -145,57 +133,60 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             .withColumn("_is_unsecured", ~F.col("_acct").isin(UNSECURED_EXCLUDE))
         )
 
-        # loan_flag row condition
+        # loan_flag row condition (boolean)
         df = df.withColumn(
-            "_loan_flag_row",
-            F.when(
-                F.col("_eligible") & (
-                    (F.col("_acct").isin({"168", "195"}) & F.col("_loan_am").isNotNull() & (F.col("_loan_am") >= 200000)) |
-                    ((F.col("_acct") == "5") & (F.col("orig_loan_am").cast("double") >= 50000)) |
-                    ((F.col("_acct") == "123") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") >= 200000)) |
-                    ((F.col("_acct") == "221") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") >= 300000))
-                ), F.lit(1)
-            ).otherwise(F.lit(0))
+            "_loan_flag",
+            F.col("_eligible") & (
+                (F.col("_acct").isin({"168", "195"}) &
+                 (F.col("orig_loan_am").cast("double") >= 200000)) |
+                ((F.col("_acct") == "5") &
+                 (F.col("orig_loan_am").cast("double") >= 50000)) |
+                ((F.col("_acct") == "123") &
+                 (F.col("orig_loan_am").cast("double") >= 200000)) |
+                ((F.col("_acct") == "221") &
+                 (F.col("orig_loan_am").cast("double") >= 300000))
+            )
         )
 
+        # ── AGGREGATE — use _i() to convert boolean → int only at sum time ───
         feature_df = df.groupBy(group_cols).agg(
 
-            # ── A. Tradeline counts (cat01) ───────────────────────────────────
-            F.sum(F.when(F.col("_in_6m"),  F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_6m"),
-            F.sum(F.when(F.col("_in_12m"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_12m"),
+            # A. Tradeline counts
+            F.sum(_i(F.col("_in_6m"))).alias("count_of_tradelines_opened_last_6m"),
+            F.sum(_i(F.col("_in_12m"))).alias("count_of_tradelines_opened_last_12m"),
 
-            F.sum(F.when(F.col("_in_6m")  & F.col("_loan_am").isNotNull() & (F.col("_loan_am") < 10000), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_6m_lt_10000"),
-            F.sum(F.when(F.col("_in_12m") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") < 20000), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_12m_lt_20000"),
+            F.sum(_i(F.col("_in_6m")  & F.col("_loan_am").isNotNull() & (F.col("_loan_am") < 10000))).alias("count_of_tradelines_opened_last_6m_lt_10000"),
+            F.sum(_i(F.col("_in_12m") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") < 20000))).alias("count_of_tradelines_opened_last_12m_lt_20000"),
 
-            F.sum(F.when(F.col("_in_6m")  & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_6m_personal_loan"),
-            F.sum(F.when(F.col("_in_12m") & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_1y_personal_loan"),
-            F.sum(F.when(F.col("_in_36m") & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_3y_personal_loan"),
-            F.sum(F.when(F.col("_in_36m") & F.col("_is_cc"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_3y_cc"),
+            F.sum(_i(F.col("_in_6m")  & F.col("_is_pl"))).alias("count_of_tradelines_opened_last_6m_personal_loan"),
+            F.sum(_i(F.col("_in_12m") & F.col("_is_pl"))).alias("count_of_tradelines_opened_last_1y_personal_loan"),
+            F.sum(_i(F.col("_in_36m") & F.col("_is_pl"))).alias("count_of_tradelines_opened_last_3y_personal_loan"),
+            F.sum(_i(F.col("_in_36m") & F.col("_is_cc"))).alias("count_of_tradelines_opened_last_3y_cc"),
 
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("CountBureauActivePersonalLoanAccounts"),
-            F.sum(F.when(F.col("_is_unsecured"), F.lit(1)).otherwise(F.lit(0))).alias("countoftradelines_unsecured"),
+            F.sum(_i(F.col("_active") & F.col("_is_pl"))).alias("CountBureauActivePersonalLoanAccounts"),
+            F.sum(_i(F.col("_is_unsecured"))).alias("countoftradelines_unsecured"),
 
-            F.sum(F.when(F.col("_in_24m") & F.col("_is_pl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000), F.lit(1)).otherwise(F.lit(0))).alias("countlessthan30KPlinLast24Months"),
-            F.sum(F.when(F.col("_is_gold") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") > 200000), F.lit(1)).otherwise(F.lit(0))).alias("countBureauGoldLoansGreaterThan2L"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_stpl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000), F.lit(1)).otherwise(F.lit(0))).alias("CountBureauActiveSTPLAccounts"),
+            F.sum(_i(F.col("_in_24m") & F.col("_is_pl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000))).alias("countlessthan30KPlinLast24Months"),
+            F.sum(_i(F.col("_is_gold") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") > 200000))).alias("countBureauGoldLoansGreaterThan2L"),
+            F.sum(_i(F.col("_active") & F.col("_is_stpl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000))).alias("CountBureauActiveSTPLAccounts"),
 
-            # ── B. Active portfolio counts by product (cat02) ─────────────────
-            F.sum(F.col("_is_active")).alias("CountBureauActiveAccounts"),                                                          # all active (replaces CountBureauActiveAccounts)
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_usl"),   F.lit(1)).otherwise(F.lit(0))).alias("active_usl"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_spl"),   F.lit(1)).otherwise(F.lit(0))).alias("active_spl"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_cc"),    F.lit(1)).otherwise(F.lit(0))).alias("active_cc"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_hl"),    F.lit(1)).otherwise(F.lit(0))).alias("active_hl"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_al"),    F.lit(1)).otherwise(F.lit(0))).alias("active_al"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_gl"),    F.lit(1)).otherwise(F.lit(0))).alias("active_gl"),
-            F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_other"), F.lit(1)).otherwise(F.lit(0))).alias("active_other_loans"),
+            # B. Active portfolio counts by product
+            F.sum(_i(F.col("_active"))).alias("active_loans"),
+            F.sum(_i(F.col("_active") & F.col("_is_usl"))).alias("active_usl"),
+            F.sum(_i(F.col("_active") & F.col("_is_spl"))).alias("active_spl"),
+            F.sum(_i(F.col("_active") & F.col("_is_cc"))).alias("active_cc"),
+            F.sum(_i(F.col("_active") & F.col("_is_hl"))).alias("active_hl"),
+            F.sum(_i(F.col("_active") & F.col("_is_al"))).alias("active_al"),
+            F.sum(_i(F.col("_active") & F.col("_is_gl"))).alias("active_gl"),
+            F.sum(_i(F.col("_active") & F.col("_is_other"))).alias("active_other_loans"),
 
-            # ── C. Bureau segment intermediates (cat19) ───────────────────────
-            F.max("_loan_flag_row").alias("loan_flag"),
-            F.sum(F.when(F.col("_eligible") & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("tot_pls"),
+            # C. Bureau segment intermediates
+            F.max(_i(F.col("_loan_flag"))).alias("loan_flag"),
+            F.sum(_i(F.col("_eligible") & F.col("_is_pl"))).alias("tot_pls"),
             F.max(F.when(F.col("_eligible") & F.col("_is_pl"), F.col("_loan_am"))).alias("max_pl_loan_amount"),
-            F.sum(F.when(F.col("_eligible") & F.col("_is_cc"), F.lit(1)).otherwise(F.lit(0))).alias("tot_cc"),
+            F.sum(_i(F.col("_eligible") & F.col("_is_cc"))).alias("tot_cc"),
             F.max(F.when(F.col("_eligible") & F.col("_is_cc"), F.col("_loan_am"))).alias("max_cc_loan_amount"),
-            F.sum(F.when(F.col("_eligible"), F.lit(1)).otherwise(F.lit(0))).alias("tot_tradelines"),
+            F.sum(_i(F.col("_eligible"))).alias("tot_tradelines"),
             F.max("_age_months").alias("bureaage_months"),
         )
 
@@ -203,24 +194,25 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
         feature_df = (
             feature_df
             .withColumn("pl_thickness",
-                F.when(F.coalesce(F.col("tot_pls"), F.lit(0)) == 0, F.lit("No PL"))
-                 .when((F.col("tot_pls") <= 2) & (F.col("max_pl_loan_amount") < 100000), F.lit("Thin PL"))
-                 .when((F.col("tot_pls") > 2)  & (F.col("max_pl_loan_amount") >= 100000), F.lit("Thick PL"))
-                 .otherwise(F.lit("Medium PL")))
+                F.when(F.coalesce(F.col("tot_pls"), F.lit(0)) == 0,                                          F.lit("No PL"))
+                 .when((F.col("tot_pls") <= 2) & (F.col("max_pl_loan_amount") < 100000),                     F.lit("Thin PL"))
+                 .when((F.col("tot_pls") >  2) & (F.col("max_pl_loan_amount") >= 100000),                    F.lit("Thick PL"))
+                 .otherwise(                                                                                   F.lit("Medium PL")))
             .withColumn("cc_thickness",
-                F.when(F.coalesce(F.col("tot_cc"), F.lit(0)) == 0, F.lit("No CC"))
-                 .when((F.col("tot_cc") == 1) & (F.col("max_cc_loan_amount") < 100000), F.lit("Thin CC"))
-                 .when((F.col("tot_cc") >= 2) & (F.col("max_cc_loan_amount") >= 100000), F.lit("Thick CC"))
-                 .otherwise(F.lit("Medium CC")))
+                F.when(F.coalesce(F.col("tot_cc"), F.lit(0)) == 0,                                           F.lit("No CC"))
+                 .when((F.col("tot_cc") == 1) & (F.col("max_cc_loan_amount") < 100000),                      F.lit("Thin CC"))
+                 .when((F.col("tot_cc") >= 2) & (F.col("max_cc_loan_amount") >= 100000),                     F.lit("Thick CC"))
+                 .otherwise(                                                                                   F.lit("Medium CC")))
             .withColumn("bureaage",
-                F.when(F.col("bureaage_months").isNotNull() & (F.col("bureaage_months") > 0)  & (F.col("bureaage_months") <= 12), F.lit("<1Y"))
-                 .when((F.col("bureaage_months") > 12) & (F.col("bureaage_months") <= 24), F.lit("1-2Y"))
-                 .when((F.col("bureaage_months") > 24) & (F.col("bureaage_months") <= 60), F.lit("2-5Y"))
-                 .when(F.col("bureaage_months") > 60, F.lit(">5Y"))
-                 .otherwise(F.lit("Unknown")))
+                F.when(F.col("bureaage_months").isNotNull() & (F.col("bureaage_months") > 0)
+                                                             & (F.col("bureaage_months") <= 12),              F.lit("<1Y"))
+                 .when((F.col("bureaage_months") > 12) & (F.col("bureaage_months") <= 24),                   F.lit("1-2Y"))
+                 .when((F.col("bureaage_months") > 24) & (F.col("bureaage_months") <= 60),                   F.lit("2-5Y"))
+                 .when( F.col("bureaage_months") > 60,                                                        F.lit(">5Y"))
+                 .otherwise(                                                                                   F.lit("Unknown")))
             .withColumn("bur_cohort",
-                F.when((F.col("bureaage_months") >= 18) & (F.col("tot_tradelines") >= 3), F.lit("Thick"))
-                 .otherwise(F.lit("Thin")))
+                F.when((F.col("bureaage_months") >= 18) & (F.col("tot_tradelines") >= 3),                    F.lit("Thick"))
+                 .otherwise(                                                                                   F.lit("Thin")))
         )
 
         self._log_done(feature_df)
