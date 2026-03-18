@@ -62,12 +62,24 @@ from core.logger import get_logger
 logger = get_logger(__name__)
 
 
-CC_CODES  = {"5", "213", "214", "220", "225"}
+CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # Appendix A CC codes
 
-PL_CODE   = "123"
-HL_CODE   = "195"
-CL_CODE   = "189"
-STPL_CODE = "242"
+PL_CODE   = "123"   # Loan, Personal Cash
+HL_CODE   = "195"   # Loan, Property
+CL_CODE   = "189"   # Loan, Consumer
+STPL_CODE = "242"   # Short Term Personal Loan
+
+SECURED_CODES = {
+    "47", "58", "195", "168", "220", "173", "221",
+    "175", "222", "172", "219", "184", "185", "191",
+    "223", "243", "241",
+}
+
+N_HISTORY    = 36
+PDU_COLS     = [f"past_due_am_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
+BAL_COLS     = [f"balance_am_{str(i).zfill(2)}"  for i in range(1, N_HISTORY + 1)]
+ALL_PDU_COLS = ["past_due_am"] + PDU_COLS    # index 0 = past_due_am, 1..36 = _01.._36
+ALL_BAL_COLS = ["balance_am"]  + BAL_COLS    # index 0 = balance_am,  1..36 = _01.._36
 
 
 

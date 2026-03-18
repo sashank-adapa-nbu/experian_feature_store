@@ -59,8 +59,15 @@ CC_CODES  = {"5", "213", "214", "220", "224", "225"}
 PL_CODE   = "123"
 STPL_CODE = "242"
 
+SECURED_CODES = {
+    "47", "58", "195", "168", "220", "173", "221",
+    "175", "222", "172", "219", "184", "185", "191",
+    "223", "243", "241",
+}
+
 N_HISTORY = 36
 PMT_COLS  = [f"actual_payment_am_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
+BAL_COLS  = [f"balance_am_{str(i).zfill(2)}"        for i in range(1, N_HISTORY + 1)]
 
 
 # =============================================================================
