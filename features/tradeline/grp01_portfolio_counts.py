@@ -2,10 +2,15 @@
 # =============================================================================
 # Group 01 — Portfolio Counts & Active Portfolio
 # =============================================================================
+# Merged from: cat01, cat02, cat19 (count/flag/segment components)
+#
 # Sections:
 #   A. Tradeline opened counts (windowed, by product, by amount)
 #   B. Active portfolio counts by product type
 #   C. Bureau segment labels (thickness, cohort)
+#
+# Redundancy removed:
+#   CountBureauActiveAccounts (cat01) == active_loans (cat02) → removed cat01 version
 # =============================================================================
 
 from pyspark.sql import DataFrame
@@ -30,7 +35,6 @@ GL_CODES  = {"191", "243"}
 AL_CODES  = {"47", "173", "172", "221", "222", "223", "246"}
 HL_CODES  = {"58", "195", "168", "240"}
 SPL_CODES = {"184", "185", "175", "241", "248", "181", "197", "198", "199", "200"}
-#unsecured codes
 USPL_CODES = {
     "123", "189", "187", "130", "242", "244", "245", "247",
     "167", "169", "170", "176", "177", "178", "179",
@@ -109,7 +113,7 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
         # Clean loan amount
         df = df.withColumn(
             "_loan_am",
-            F.when(F.col("orig_loan_am") > 0, F.col("orig_loan_am"))
+            F.when(F.col("orig_loan_am").cast("double") > 0, F.col("orig_loan_am").cast("double"))
              .otherwise(F.lit(None))
         )
 
@@ -125,19 +129,19 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             .withColumn("_eligible", F.col("_months_since_open").isNotNull())
         )
 
-        # Product flags
+        # Product flags — all BOOLEAN (booleans work fine in F.when conditions & &/|)
         df = (
             df
-            .withColumn("_is_pl",       F.col("_acct") == PL_CODE)
-            .withColumn("_is_cc",       F.col("_acct").isin(CC_CODES))
-            .withColumn("_is_gold",     F.col("_acct") == GOLD_CODE)
-            .withColumn("_is_stpl",     F.col("_acct") == STPL_CODE)
-            .withColumn("_is_gl",       F.col("_acct").isin(GL_CODES))
-            .withColumn("_is_al",       F.col("_acct").isin(AL_CODES))
-            .withColumn("_is_hl",       F.col("_acct").isin(HL_CODES))
-            .withColumn("_is_spl",      F.col("_acct").isin(SPL_CODES))
-            .withColumn("_is_usl",      F.col("_acct").isin(USPL_CODES))
-            .withColumn("_is_other",    ~F.col("_acct").isin(ALL_NAMED))
+            .withColumn("_is_pl",        F.col("_acct") == PL_CODE)
+            .withColumn("_is_cc",        F.col("_acct").isin(CC_CODES))
+            .withColumn("_is_gold",      F.col("_acct") == GOLD_CODE)
+            .withColumn("_is_stpl",      F.col("_acct") == STPL_CODE)
+            .withColumn("_is_gl",        F.col("_acct").isin(GL_CODES))
+            .withColumn("_is_al",        F.col("_acct").isin(AL_CODES))
+            .withColumn("_is_hl",        F.col("_acct").isin(HL_CODES))
+            .withColumn("_is_spl",       F.col("_acct").isin(SPL_CODES))
+            .withColumn("_is_usl",       F.col("_acct").isin(USPL_CODES))
+            .withColumn("_is_other",     ~F.col("_acct").isin(ALL_NAMED))
             .withColumn("_is_unsecured", ~F.col("_acct").isin(UNSECURED_EXCLUDE))
         )
 
@@ -169,14 +173,14 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             F.sum(F.when(F.col("_in_36m") & F.col("_is_cc"), F.lit(1)).otherwise(F.lit(0))).alias("count_of_tradelines_opened_last_3y_cc"),
 
             F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_pl"), F.lit(1)).otherwise(F.lit(0))).alias("CountBureauActivePersonalLoanAccounts"),
-            F.sum("_is_unsecured").alias("countoftradelines_unsecured"),
+            F.sum(F.when(F.col("_is_unsecured"), F.lit(1)).otherwise(F.lit(0))).alias("countoftradelines_unsecured"),
 
             F.sum(F.when(F.col("_in_24m") & F.col("_is_pl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000), F.lit(1)).otherwise(F.lit(0))).alias("countlessthan30KPlinLast24Months"),
             F.sum(F.when(F.col("_is_gold") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") > 200000), F.lit(1)).otherwise(F.lit(0))).alias("countBureauGoldLoansGreaterThan2L"),
             F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_stpl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000), F.lit(1)).otherwise(F.lit(0))).alias("CountBureauActiveSTPLAccounts"),
 
-            # ── B. Active portfolio counts by product (cat02) ───────────────── # all active (replaces CountBureauActiveAccounts)
-            F.sum(F.col("_is_active")).alias("CountBureauActiveAccounts"),                                                         
+            # ── B. Active portfolio counts by product (cat02) ─────────────────
+            F.sum(F.col("_is_active")).alias("CountBureauActiveAccounts"),                                                          # all active (replaces CountBureauActiveAccounts)
             F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_usl"),   F.lit(1)).otherwise(F.lit(0))).alias("active_usl"),
             F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_spl"),   F.lit(1)).otherwise(F.lit(0))).alias("active_spl"),
             F.sum(F.when((F.col("_is_active") == 1) & F.col("_is_cc"),    F.lit(1)).otherwise(F.lit(0))).alias("active_cc"),

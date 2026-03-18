@@ -8,7 +8,7 @@ from typing import List, Optional
 from pyspark.sql import DataFrame, SparkSession
 import pyspark.sql.functions as F
 
-from features.tradeline.registry import TRADELINE_FEATURE_CLASSES, ENQUIRY_FEATURE_CLASSES
+from features.registry import TRADELINE_FEATURE_CLASSES, ENQUIRY_FEATURE_CLASSES
 from output.writer import FeatureWriter
 from core.logger import get_logger
 from config import config

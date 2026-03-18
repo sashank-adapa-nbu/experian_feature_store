@@ -173,12 +173,12 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
             df
             .withColumn(
                 "_loan_am",
-                F.when(F.col("orig_loan_am") > 0, F.col("orig_loan_am"))
+                F.when(F.col("orig_loan_am").cast("double") > 0, F.col("orig_loan_am").cast("double"))
                  .otherwise(F.lit(None).cast("double"))
             )
             .withColumn(
                 "_credit_limit_am",
-                F.when(F.col("credit_limit_am") > 0, F.col("credit_limit_am"))
+                F.when(F.col("credit_limit_am").cast("double") > 0, F.col("credit_limit_am").cast("double"))
                  .otherwise(F.lit(None).cast("double"))
             )
         )
@@ -450,7 +450,7 @@ class CreditCardLimitsFeatures(TradelineFeatureBase):
         # ── STEP 3: Clean orig_loan_am — treat -1 as null ─────────────────────
         df = df.withColumn(
             "_loan_am",
-            F.when(F.col("orig_loan_am") > 0, F.col("orig_loan_am"))
+            F.when(F.col("orig_loan_am").cast("double") > 0, F.col("orig_loan_am").cast("double"))
              .otherwise(F.lit(None).cast("double"))
         )
 

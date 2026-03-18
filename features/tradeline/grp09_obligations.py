@@ -81,11 +81,11 @@ class ObligationsFeatures(TradelineFeatureBase):
             slot = k - m   # actual slot index (0=balance_am, 1=balance_am_01, ...)
             if m > 0:
                 # gap: as_of ahead of balance_dt → use BALANCE_AM as best available
-                raw = F.when(F.col("balance_am") >= 0,
+                raw = F.when(F.col("balance_am").cast("double") >= 0,
                              F.col("balance_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif slot == 0:
-                raw = F.when(F.col("balance_am") >= 0,
+                raw = F.when(F.col("balance_am").cast("double") >= 0,
                              F.col("balance_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif 1 <= slot <= N_BAL_HISTORY:
@@ -104,11 +104,11 @@ class ObligationsFeatures(TradelineFeatureBase):
         for m in range(-N_PMT_HISTORY, N_PMT_HISTORY + 1):
             slot = k - m
             if m > 0:
-                raw = F.when(F.col("actual_payment_am") >= 0,
+                raw = F.when(F.col("actual_payment_am").cast("double") >= 0,
                              F.col("actual_payment_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif slot == 0:
-                raw = F.when(F.col("actual_payment_am") >= 0,
+                raw = F.when(F.col("actual_payment_am").cast("double") >= 0,
                              F.col("actual_payment_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif 1 <= slot <= N_PMT_HISTORY:

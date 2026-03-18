@@ -369,12 +369,12 @@ class RepaymentRatioFeatures(TradelineFeatureBase):
 
             if m > 0:
                 # as_of is ahead of balance_dt (gap) — use BALANCE_AM directly
-                raw = F.when(F.col("balance_am") >= 0,
+                raw = F.when(F.col("balance_am").cast("double") >= 0,
                              F.col("balance_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif slot == 0:
                 # as_of == balance_dt
-                raw = F.when(F.col("balance_am") >= 0,
+                raw = F.when(F.col("balance_am").cast("double") >= 0,
                              F.col("balance_am").cast("double")) \
                        .otherwise(F.lit(None).cast("double"))
             elif 1 <= slot <= N_HISTORY:

@@ -420,7 +420,7 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
             F.when(
                 F.col("_is_cc") &
                 F.col("orig_loan_am").isNotNull() &
-                (F.col("orig_loan_am") > 0),
+                (F.col("orig_loan_am").cast("double") > 0),
                 F.col("orig_loan_am").cast("double")
             ).otherwise(F.lit(None).cast("double"))
         )
