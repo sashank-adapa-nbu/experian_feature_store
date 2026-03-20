@@ -8,6 +8,7 @@ from typing import List
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -17,12 +18,34 @@ logger = get_logger(__name__)
 # =============================================================================
 
 PL_CODE  = "123"
-CC_CODES = {"5", "213", "214", "220", "224", "225"}
+CC_CODES = {"5", "213", "214", "220", "224", "225"}    # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 
 SECURED_CODES = {
-    "47", "58", "195", "168", "220", "173", "221",
-    "175", "222", "172", "219", "184", "185", "191",
-    "223", "243", "241",
+    "47",   # Instalment Loan, Automobile
+    "58",   # Instalment Loan, Mortgage
+    "168",  # Microfinance, Housing
+    "172",  # Instalment Loan, Commercial Vehicle
+    "173",  # Instalment Loan, Two-Wheeler
+    "175",  # Business Loan Against Bank Deposits
+    "181",  # Credit Facility, Non-Funded
+    "184",  # Loan Against Bank Deposits
+    "185",  # Loan Against Shares/Securities
+    "191",  # Loan, Gold
+    "195",  # Loan, Property
+    "197",  # Non-Funded Credit Facility, General
+    "198",  # Non-Funded Credit Facility, Priority Sector - Small Business
+    "199",  # Non-Funded Credit Facility, Priority Sector - Agriculture
+    "200",  # Non-Funded Credit Facility, Priority Sector - Others
+    "219",  # Leasing, Other
+    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
+    "221",  # Used Car Loan
+    "222",  # Construction Equipment Loan
+    "223",  # Tractor Loan
+    "240",  # Pradhan Mantri Awas Yojna  (housing scheme)
+    "241",  # Business Loan – Secured
+    "243",  # Priority Sector Gold Loan
+    "246",  # P2P Auto Loan
+    "248",  # GECL Loan Secured
 }
 
 
@@ -116,12 +139,6 @@ class BureauVintageFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df

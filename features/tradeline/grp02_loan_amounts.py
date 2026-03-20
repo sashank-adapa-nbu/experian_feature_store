@@ -22,7 +22,7 @@
 #   • STPL    : acct_type_cd = '242'  AND  orig_loan_am <= 30,000
 #   • PL      : acct_type_cd = '123'
 #   • GL      : acct_type_cd IN ('191','243')
-#   • CC      : acct_type_cd IN ('5','213','214','220','224','225')
+#   • CC      : acct_type_cd IN ('5','213','214','220','224','225')  — all CCs incl. Secured CC (220)
 #   • HL      : acct_type_cd IN ('58','195','168','240')
 #   • AL      : acct_type_cd IN ('47','173','172','221','222','223','246')
 #   • SPL     : acct_type_cd IN ('184','185','175','241','248','181','197','198','199','200')
@@ -32,13 +32,13 @@
 #     orig_loan_am is null, as CC products report limit not disbursed amount
 # =============================================================================
 
-from features.tradeline.grp04_bureau_vintage import SECURED_CODES
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from typing import List
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -50,7 +50,7 @@ logger = get_logger(__name__)
 GL_CODES   = {"191", "243"}
 AL_CODES   = {"47", "173", "172", "221", "222", "223", "246"}
 HL_CODES   = {"58", "195", "168", "240"}
-CC_CODES   = {"5", "213", "214", "220", "224", "225"}
+CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 SPL_CODES  = {"184", "185", "175", "241", "248", "181", "197", "198", "199", "200"}
 USL_CODES = {
     "123", "189", "187", "130",
@@ -62,15 +62,37 @@ USL_CODES = {
 
 PL_CODE       = "123"
 STPL_CODE     = "242"
-CONSUMER_CODE = "189"  
+CONSUMER_CODE = "189"  # Loan, Consumer — Appendix A acct_type_cd
+
+ALL_NAMED_CODES = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES
 
 SECURED_CODES = {
-    "47", "58", "195", "168", "220", "173", "221",
-    "175", "222", "172", "219", "184", "185", "191",
-    "223", "243", "241",
+    "47",   # Instalment Loan, Automobile
+    "58",   # Instalment Loan, Mortgage
+    "168",  # Microfinance, Housing
+    "172",  # Instalment Loan, Commercial Vehicle
+    "173",  # Instalment Loan, Two-Wheeler
+    "175",  # Business Loan Against Bank Deposits
+    "181",  # Credit Facility, Non-Funded
+    "184",  # Loan Against Bank Deposits
+    "185",  # Loan Against Shares/Securities
+    "191",  # Loan, Gold
+    "195",  # Loan, Property
+    "197",  # Non-Funded Credit Facility, General
+    "198",  # Non-Funded Credit Facility, Priority Sector - Small Business
+    "199",  # Non-Funded Credit Facility, Priority Sector - Agriculture
+    "200",  # Non-Funded Credit Facility, Priority Sector - Others
+    "219",  # Leasing, Other
+    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
+    "221",  # Used Car Loan
+    "222",  # Construction Equipment Loan
+    "223",  # Tractor Loan
+    "240",  # Pradhan Mantri Awas Yojna  (housing scheme)
+    "241",  # Business Loan – Secured
+    "243",  # Priority Sector Gold Loan
+    "246",  # P2P Auto Loan
+    "248",  # GECL Loan Secured
 }
-
-ALL_NAMED_CODES = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES 
 
 
 
@@ -136,19 +158,13 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         (derived companion feature as total revolving credit capacity)
     """
 
-    CATEGORY = "cat03_loan_amount_exposure"  # grp02_loan_amounts
+    CATEGORY = "grp02a_loan_amount_exposure"  # grp02_loan_amounts
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -428,19 +444,13 @@ class CreditCardLimitsFeatures(TradelineFeatureBase):
     CreditLimit_50000_Vintage_12   CC accounts with limit >= 50K, opened <= 12m ago
     """
 
-    CATEGORY = "cat04_credit_card_limits"  # grp02_loan_amounts
+    CATEGORY = "grp02b_credit_card_limits"  # grp02_loan_amounts
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -566,19 +576,13 @@ class HighestCreditSignalsFeatures(TradelineFeatureBase):
         High-value gold loans indicate asset ownership and lender trust.
     """
 
-    CATEGORY = "cat07_highest_credit_signals"  # grp02_loan_amounts
+    CATEGORY = "grp02c_highest_credit_signals"  # grp02_loan_amounts
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -781,19 +785,13 @@ class LoanVolumeOverTimeFeatures(TradelineFeatureBase):
         High ratio → borrowing concentrated in recent 12 months = velocity spike.
     """
 
-    CATEGORY = "cat08_loan_volume_over_time"  # grp02_loan_amounts
+    CATEGORY = "grp02d_loan_volume_over_time"  # grp02_loan_amounts
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df

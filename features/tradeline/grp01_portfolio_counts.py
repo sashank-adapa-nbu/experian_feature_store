@@ -9,6 +9,7 @@ from typing import List
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -16,7 +17,7 @@ logger = get_logger(__name__)
 # CODE SETS
 # =============================================================================
 
-CC_CODES  = {"5", "214", "220", "213", "224", "225"}
+CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 PL_CODE   = "123"
 STPL_CODE = "242"
 GOLD_CODE = "191"
@@ -25,17 +26,21 @@ GL_CODES  = {"191", "243"}
 AL_CODES  = {"47", "173", "172", "221", "222", "223", "246"}
 HL_CODES  = {"58", "195", "168", "240"}
 SPL_CODES = {"184", "185", "175", "241", "248", "181", "197", "198", "199", "200"}
-USPL_CODES = {
+USL_CODES = {
     "123", "189", "187", "130", "242", "244", "245", "247",
     "167", "169", "170", "176", "177", "178", "179",
     "228", "227", "226", "249",
 }
 OTHER_CODES = {"999", "121", "219", "196", "215", "216", "217"}
-ALL_NAMED   = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USPL_CODES
+ALL_NAMED   = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES
 
 UNSECURED_EXCLUDE = {
-    "47", "58", "195", "168", "220", "173", "221",
-    "175", "222", "172", "219", "184", "185", "191", "223",
+    # All secured codes — excluded when counting unsecured tradelines
+    # Must match SECURED_CODES exactly (Appendix A verified)
+    # NOTE: 220 (Secured CC) removed — CCs are treated as unsecured/CC category
+    "47", "58", "168", "172", "173", "175", "181", "184", "185",
+    "191", "195", "197", "198", "199", "200", "219", "221",
+    "222", "223", "240", "241", "243", "246", "248",
 }
 
 
@@ -57,12 +62,6 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
-        def parse_date(c):
-            return F.coalesce(
-                F.to_date(F.col(c), "dd/MM/yyyy"),
-                F.to_date(F.col(c), "yyyy-MM-dd"),
-                F.to_date(F.col(c), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -128,7 +127,7 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             .withColumn("_is_al",        F.col("_acct").isin(AL_CODES))
             .withColumn("_is_hl",        F.col("_acct").isin(HL_CODES))
             .withColumn("_is_spl",       F.col("_acct").isin(SPL_CODES))
-            .withColumn("_is_usl",       F.col("_acct").isin(USPL_CODES))
+            .withColumn("_is_usl",       F.col("_acct").isin(USL_CODES))
             .withColumn("_is_other",     ~F.col("_acct").isin(ALL_NAMED))
             .withColumn("_is_unsecured", ~F.col("_acct").isin(UNSECURED_EXCLUDE))
         )
@@ -172,7 +171,7 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
 
             # B. Active portfolio counts by product
             F.sum(_i(F.col("_active"))).alias("active_loans"),
-            F.sum(_i(F.col("_active") & F.col("_is_usl"))).alias("active_usl"),
+            F.sum(_i(F.col("_active") & F.col("_is_unsecured"))).alias("active_unsecured"),
             F.sum(_i(F.col("_active") & F.col("_is_spl"))).alias("active_spl"),
             F.sum(_i(F.col("_active") & F.col("_is_cc"))).alias("active_cc"),
             F.sum(_i(F.col("_active") & F.col("_is_hl"))).alias("active_hl"),

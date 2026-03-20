@@ -37,7 +37,7 @@
 #   open_dt <= as_of_dt AND (closed_dt IS NULL OR closed_dt > as_of_dt)
 #
 # Product filters:
-#   CC  : '5','213','214','220','224','225'
+#   CC  : '5','213','214','220','224','225'  — all CCs incl. Secured CC (220)
 #   PL  : '123'
 # =============================================================================
 
@@ -47,6 +47,7 @@ from typing import List, Optional
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -55,14 +56,36 @@ logger = get_logger(__name__)
 # CONSTANTS
 # =============================================================================
 
-CC_CODES  = {"5", "213", "214", "220", "224", "225"}
+CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 PL_CODE   = "123"
 STPL_CODE = "242"
 
 SECURED_CODES = {
-    "47", "58", "195", "168", "220", "173", "221",
-    "175", "222", "172", "219", "184", "185", "191",
-    "223", "243", "241",
+    "47",   # Instalment Loan, Automobile
+    "58",   # Instalment Loan, Mortgage
+    "168",  # Microfinance, Housing
+    "172",  # Instalment Loan, Commercial Vehicle
+    "173",  # Instalment Loan, Two-Wheeler
+    "175",  # Business Loan Against Bank Deposits
+    "181",  # Credit Facility, Non-Funded
+    "184",  # Loan Against Bank Deposits
+    "185",  # Loan Against Shares/Securities
+    "191",  # Loan, Gold
+    "195",  # Loan, Property
+    "197",  # Non-Funded Credit Facility, General
+    "198",  # Non-Funded Credit Facility, Priority Sector - Small Business
+    "199",  # Non-Funded Credit Facility, Priority Sector - Agriculture
+    "200",  # Non-Funded Credit Facility, Priority Sector - Others
+    "219",  # Leasing, Other
+    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
+    "221",  # Used Car Loan
+    "222",  # Construction Equipment Loan
+    "223",  # Tractor Loan
+    "240",  # Pradhan Mantri Awas Yojna  (housing scheme)
+    "241",  # Business Loan – Secured
+    "243",  # Priority Sector Gold Loan
+    "246",  # P2P Auto Loan
+    "248",  # GECL Loan Secured
 }
 
 N_HISTORY = 36
@@ -95,7 +118,7 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
     Missed payment: payment amount <= 0 for a valid (non-NULL) slot.
     """
 
-    CATEGORY = "cat13_payment_behaviour"
+    CATEGORY = "grp08a_payment_behaviour"
 
     @staticmethod
     def _pmt_slot(k: int,
@@ -139,12 +162,6 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse dates ───────────────────────────────────────────────
-        def parse_date(c):
-            return F.coalesce(
-                F.to_date(F.col(c), "dd/MM/yyyy"),
-                F.to_date(F.col(c), "yyyy-MM-dd"),
-                F.to_date(F.col(c), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -158,7 +175,7 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
         # Uses balance_dt (not last_reporting_pymt_dt) as per spec for cat13
         df = df.withColumn(
             "_md",
-            F.round(F.months_between(
+            F.ceil(F.months_between(
                 F.col("_as_of_dt"), F.col("_bal_dt")
             )).cast("int")
         )
@@ -235,9 +252,14 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
         feature_df = df.groupBy(group_cols).agg(
 
             # ── Windowed payment sums — all accounts ─────────────────────────
-            F.sum(F.coalesce(*w3,  F.lit(0.0))).alias("payments_3_month"),
-            F.sum(F.coalesce(*w6,  F.lit(0.0))).alias("payments_6_month"),
-            F.sum(F.coalesce(*w12, F.lit(0.0))).alias("payments_12_month"),
+            # Null-aware payment sums:
+            # Sum only non-null payment slots; NULL if entire window has no reporting data
+            F.sum(F.when(F.greatest(*w3).isNotNull(),
+                         F.coalesce(*w3, F.lit(0.0)))).alias("payments_3_month"),
+            F.sum(F.when(F.greatest(*w6).isNotNull(),
+                         F.coalesce(*w6, F.lit(0.0)))).alias("payments_6_month"),
+            F.sum(F.when(F.greatest(*w12).isNotNull(),
+                         F.coalesce(*w12, F.lit(0.0)))).alias("payments_12_month"),
 
             # ── Active CC repayment features ──────────────────────────────────
             # MAX/MIN across all available payment slots in window
@@ -356,7 +378,7 @@ class RepaymentRatioFeatures(TradelineFeatureBase):
                                     High = PL repaid better than STPL → lower PL risk
     """
 
-    CATEGORY = "cat15_repayment_ratio"
+    CATEGORY = "grp08b_repayment_ratio"
 
     @staticmethod
     def _balance_at_asof() -> F.Column:
@@ -400,12 +422,6 @@ class RepaymentRatioFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse dates ───────────────────────────────────────────────
-        def parse_date(c):
-            return F.coalesce(
-                F.to_date(F.col(c), "dd/MM/yyyy"),
-                F.to_date(F.col(c), "yyyy-MM-dd"),
-                F.to_date(F.col(c), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -418,7 +434,7 @@ class RepaymentRatioFeatures(TradelineFeatureBase):
         # ── STEP 2: month_diff ────────────────────────────────────────────────
         df = df.withColumn(
             "_md",
-            F.round(F.months_between(F.col("_as_of_dt"), F.col("_bal_dt"))).cast("int")
+            F.ceil(F.months_between(F.col("_as_of_dt"), F.col("_bal_dt"))).cast("int")
         )
 
         # ── STEP 3: Active flag ───────────────────────────────────────────────

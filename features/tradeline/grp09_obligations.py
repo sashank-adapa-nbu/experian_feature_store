@@ -8,7 +8,7 @@
 #   When EMI column is missing/zero, we impute using product-specific rate × balance:
 #
 #   acct_type_cd = 123 (PL)           → 0.03  × orig_loan_am
-#   acct_type_cd = 5   (CC)           → 0.05  × orig_loan_am
+#   acct_type_cd IN (5,213,214,220,224,225) (CC) → 0.05  × orig_loan_am
 #   acct_type_cd IN (58,195) (HL)     → 0.01  × orig_loan_am
 #   acct_type_cd IN (173,189) (2W/CL) → 0.05  × orig_loan_am
 #   acct_type_cd = 47  (AL)           → 0.025 × orig_loan_am
@@ -42,6 +42,7 @@ from typing import List
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -125,12 +126,6 @@ class ObligationsFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse dates ───────────────────────────────────────────────
-        def parse_date(c):
-            return F.coalesce(
-                F.to_date(F.col(c), "dd/MM/yyyy"),
-                F.to_date(F.col(c), "yyyy-MM-dd"),
-                F.to_date(F.col(c), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -143,7 +138,7 @@ class ObligationsFeatures(TradelineFeatureBase):
         # ── STEP 2: month_diff ────────────────────────────────────────────────
         df = df.withColumn(
             "_md",
-            F.round(F.months_between(F.col("_as_of_dt"), F.col("_bal_dt"))).cast("int")
+            F.ceil(F.months_between(F.col("_as_of_dt"), F.col("_bal_dt"))).cast("int")
         )
 
         # ── STEP 3: Normalise acct_type_cd and clean amounts ─────────────────
@@ -163,8 +158,8 @@ class ObligationsFeatures(TradelineFeatureBase):
         imputed_emi = (
             F.when(F.col("_acct") == "123",
                    F.lit(0.03)         * F.col("_orig_am"))          # PL
-             .when(F.col("_acct") == "5",
-                   F.lit(0.05)         * F.col("_orig_am"))          # CC
+             .when(F.col("_acct").isin({"5", "213", "214", "220", "224", "225"}),
+                   F.lit(0.05)         * F.col("_orig_am"))          # CC (all codes incl. 220)
              .when(F.col("_acct").isin({"58", "195"}),
                    F.lit(0.01)         * F.col("_orig_am"))          # HL
              .when(F.col("_acct").isin({"173", "189"}),
@@ -260,7 +255,7 @@ class ObligationsFeatures(TradelineFeatureBase):
             # For each month k, sum payments across all tradelines, then take max
             # Here we take MAX of per-tradeline payment slots → customer-level max
             F.max(
-                F.greatest(*[F.coalesce(s, F.lit(0.0)) for s in pmt_slots_12m])
+                F.greatest(*pmt_slots_12m)
             ).alias("Max_obligations_paid_last12months"),
 
             # Mean payment in last 12m (all tradelines)
@@ -292,7 +287,7 @@ class ObligationsFeatures(TradelineFeatureBase):
             # CC obligations at as_of
             F.sum(
                 F.when(F.col("_is_obligating") & F.col("_acct").isin(
-                    {"5", "213", "214", "220", "224", "225"}),
+                    {"5", "213", "214", "220", "224", "225"}),  # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
                        F.col("_final_emi")).otherwise(F.lit(0.0))
             ).alias("obligations_cc"),
         )

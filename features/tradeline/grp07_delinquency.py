@@ -48,6 +48,7 @@ from typing import List, Optional
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -61,7 +62,7 @@ USL_CODES = {
     "167", "169", "170", "176", "177", "178", "179",
     "228", "227", "226", "249",
 }
-CC_CODES = {"5", "213", "214", "220", "224", "225"}
+CC_CODES = {"5", "213", "214", "220", "224", "225"}    # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 HL_CODES = {"58", "195", "168", "240"}
 GL_CODES = {"191", "243"}
 AL_CODES = {"47", "173", "172", "221", "222", "223", "246"}
@@ -131,12 +132,6 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse dates ───────────────────────────────────────────────
-        def parse_date(c):
-            return F.coalesce(
-                F.to_date(F.col(c), "dd/MM/yyyy"),
-                F.to_date(F.col(c), "yyyy-MM-dd"),
-                F.to_date(F.col(c), "MM/dd/yyyy"),
-            )
 
         df = (
             df
@@ -147,7 +142,7 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
         # ── STEP 2: month_diff ────────────────────────────────────────────────
         df = df.withColumn(
             "_md",
-            F.round(F.months_between(
+            F.ceil(F.months_between(
                 F.col("_as_of_dt"), F.col("_rpt_dt")
             )).cast("int")
         )
@@ -213,19 +208,30 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             F.max(F.greatest(*w36_pl)).alias("max_dpd_pl_3y"),
 
             # ── DPD counts ────────────────────────────────────────────────────
-            F.sum(F.when(F.greatest(*w12)    >  0, F.lit(1)).otherwise(F.lit(0))
+            # Null-aware DPD counts:
+            # NULL if NO data in window (all slots NULL = no reporting history)
+            # 0    if data exists but DPD was 0 in all reported months
+            # N    count of months with DPD > threshold
+            F.sum(F.when(F.greatest(*w12).isNotNull(),
+                         F.when(F.greatest(*w12) > 0,  F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd_in_12_months"),
-            F.sum(F.when(F.greatest(*w12)    >= 30, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w12).isNotNull(),
+                         F.when(F.greatest(*w12) >= 30, F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd30_in_12_months"),
-            F.sum(F.when(F.greatest(*w12)    >= 60, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w12).isNotNull(),
+                         F.when(F.greatest(*w12) >= 60, F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd60_in_12_months"),
-            F.sum(F.when(F.greatest(*w12)    >= 90, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w12).isNotNull(),
+                         F.when(F.greatest(*w12) >= 90, F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd90_in_12_months"),
-            F.sum(F.when(F.greatest(*w36)    >  0, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w36).isNotNull(),
+                         F.when(F.greatest(*w36) > 0,  F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd_in_36_months"),
-            F.sum(F.when(F.greatest(*w12_pl) >= 30, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w12_pl).isNotNull(),
+                         F.when(F.greatest(*w12_pl) >= 30, F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd30_pl_12m"),
-            F.sum(F.when(F.greatest(*w36_pl) >  0, F.lit(1)).otherwise(F.lit(0))
+            F.sum(F.when(F.greatest(*w36_pl).isNotNull(),
+                         F.when(F.greatest(*w36_pl) > 0, F.lit(1)).otherwise(F.lit(0)))
             ).alias("no_of_dpd_pl_36m"),
 
             # ── DPD bucket flags ──────────────────────────────────────────────

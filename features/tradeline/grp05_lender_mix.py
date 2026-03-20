@@ -56,7 +56,7 @@
 #
 # Product filters:
 #   PL  : '123'
-#   CC  : '5','213','214','220','224','225'
+#   CC  : '5','213','214','220','224','225'  — all CCs incl. Secured CC (220)
 #   CL  : '189'  (Consumer Loan)
 # =============================================================================
 
@@ -66,6 +66,7 @@ from typing import List
 
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
+from core.date_utils import parse_date
 
 logger = get_logger(__name__)
 
@@ -86,14 +87,16 @@ BANK_CODES = {"PVT", "PUB", "FOR", "RRB", "SFB", "COB"}
 
 # Product codes
 PL_CODE = "123"
-CC_CODES = {"5", "213", "214", "220", "224", "225"}
+CC_CODES = {"5", "213", "214", "220", "224", "225"}    # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
 CL_CODE  = "189"
 
 # Secured account type codes (same set as cat01/cat03/cat06)
 SECURED_ACCT_CODES = {
-    "47", "58", "195", "168", "220", "173", "221",
+    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
+    "47", "58", "195", "168", "173", "221",
     "175", "222", "172", "219", "184", "185", "191",
-    "223", "243", "241",
+    "181", "197", "198", "199", "200",
+    "223", "240", "241", "243", "246", "248",
 }
 
 
@@ -197,12 +200,6 @@ class LenderTypeMixFeatures(TradelineFeatureBase):
         group_cols = pk_cols + [as_of_col]
 
         # ── STEP 1: Parse date columns ────────────────────────────────────────
-        def parse_date(col_name: str) -> F.Column:
-            return F.coalesce(
-                F.to_date(F.col(col_name), "dd/MM/yyyy"),
-                F.to_date(F.col(col_name), "yyyy-MM-dd"),
-                F.to_date(F.col(col_name), "MM/dd/yyyy"),
-            )
 
         df = (
             df
