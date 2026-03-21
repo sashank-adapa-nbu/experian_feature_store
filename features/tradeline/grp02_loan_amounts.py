@@ -127,10 +127,10 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         Sum of orig_loan_am for ALL PL accounts (acct_type='123')
 
     max_loanamount_sl
-        Max orig_loan_am across secured loan accounts (SPL_CODES)
+        Max orig_loan_am across secured loan accounts (SECURED_CODES)
 
     max_loanamount_usl
-        Max orig_loan_am across unsecured loan accounts (USL_CODES)
+        Max orig_loan_am across unsecured loan accounts (~SECURED_CODES)
 
     max_loanamount_cc
         Max credit_limit_am for CC accounts (falls back to orig_loan_am if null)
@@ -213,15 +213,15 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         # ── STEP 5: Product type flags ────────────────────────────────────────
         df = (
             df
-            .withColumn("_is_pl",    F.col("_acct_type") == PL_CODE)
-            .withColumn("_is_stpl",  F.col("_acct_type") == STPL_CODE)
-            .withColumn("_is_gl",    F.col("_acct_type").isin(GL_CODES))
-            .withColumn("_is_al",    F.col("_acct_type").isin(AL_CODES))
-            .withColumn("_is_hl",    F.col("_acct_type").isin(HL_CODES))
-            .withColumn("_is_cc",    F.col("_acct_type").isin(CC_CODES))
-            .withColumn("_is_spl",   F.col("_acct_type").isin(SPL_CODES))
-            .withColumn("_is_usl",   F.col("_acct_type").isin(USL_CODES))
-            .withColumn("_is_other", ~F.col("_acct_type").isin(ALL_NAMED_CODES))
+            .withColumn("_is_pl",        F.col("_acct_type") == PL_CODE)
+            .withColumn("_is_stpl",      F.col("_acct_type") == STPL_CODE)
+            .withColumn("_is_gl",        F.col("_acct_type").isin(GL_CODES))
+            .withColumn("_is_al",        F.col("_acct_type").isin(AL_CODES))
+            .withColumn("_is_hl",        F.col("_acct_type").isin(HL_CODES))
+            .withColumn("_is_cc",        F.col("_acct_type").isin(CC_CODES))
+            .withColumn("_is_other",    ~F.col("_acct_type").isin(ALL_NAMED_CODES))
+            .withColumn("_is_secured",   F.col("_acct_type").isin(SECURED_CODES))
+            .withColumn("_is_unsecured", ~F.col("_acct_type").isin(SECURED_CODES))
         )
 
         # ── STEP 6: STPL qualifier — acct_type='242' AND amount <= 30,000 ────
@@ -249,43 +249,50 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
             ).alias("maxLoanAmountAllAccountsExceptGLandCC"),
 
             # STPL — inactive (closed), amount <= 30K
-            F.max(
-                F.when(F.col("_is_stpl_qualified") & (F.col("_is_inactive") == 1), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_stpl_qualified") & (F.col("_is_inactive") == 1), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("MaxLoanAmountInactiveSTPL"),
 
             # STPL — active (open), amount <= 30K
-            F.max(
-                F.when(F.col("_is_stpl_qualified") & (F.col("_is_active") == 1), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_stpl_qualified") & (F.col("_is_active") == 1), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("MaxLoanAmountActiveSTPL"),
 
             # STPL — all (active + inactive), amount <= 30K
-            F.max(
-                F.when(F.col("_is_stpl_qualified"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_stpl_qualified"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("MaxLoanAmountTotalSTPL"),
 
             # Personal Loan — active accounts only
-            F.max(
-                F.when(F.col("_is_pl") & (F.col("_is_active") == 1), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_pl") & (F.col("_is_active") == 1), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("MaxLoanAmountActivePersonalLoan"),
 
             # Personal Loan — sum of active accounts
-            F.sum(
-                F.when(F.col("_is_pl") & (F.col("_is_active") == 1), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_pl") & (F.col("_is_active") == 1), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("TotalLoanAmtOnActivePLAccounts"),
 
             # Personal Loan — sum of ALL accounts (active + inactive)
-            F.sum(
-                F.when(F.col("_is_pl"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_pl"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("sumloanamount_personalloan"),
 
-            # Max by product group
-            F.max(F.when(F.col("_is_spl"),   F.col("_loan_am"))).alias("max_loanamount_sl"),
-            F.max(F.when(F.col("_is_usl"),   F.col("_loan_am"))).alias("max_loanamount_usl"),
-            F.max(F.when(F.col("_is_cc"),    F.col("_cc_am")  )).alias("max_loanamount_cc"),
-            F.max(F.when(F.col("_is_gl"),    F.col("_loan_am"))).alias("max_loanamount_gl"),
-            F.max(F.when(F.col("_is_hl"),    F.col("_loan_am"))).alias("max_loanamount_hl"),
-            F.max(F.when(F.col("_is_al"),    F.col("_loan_am"))).alias("max_loanamount_al"),
-            F.max(F.when(F.col("_is_other"), F.col("_loan_am"))).alias("max_loanamount_others"),
+            # Max by product group — coalesced to 0 when product absent
+            # (companion flags in grp06 — has_taken_X_ever/has_active_X_flag — explain the 0)
+            F.coalesce(F.max(F.when(F.col("_is_secured"),   F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_sl"),
+            F.coalesce(F.max(F.when(F.col("_is_unsecured"), F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_usl"),
+            F.coalesce(F.max(F.when(F.col("_is_cc"),    F.col("_cc_am")  )), F.lit(0).cast("double")).alias("max_loanamount_cc"),
+            F.coalesce(F.max(F.when(F.col("_is_gl"),    F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_gl"),
+            F.coalesce(F.max(F.when(F.col("_is_hl"),    F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_hl"),
+            F.coalesce(F.max(F.when(F.col("_is_al"),    F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_al"),
+            F.coalesce(F.max(F.when(F.col("_is_other"), F.col("_loan_am"))), F.lit(0).cast("double")).alias("max_loanamount_others"),
 
             # Global max across ALL accounts
             F.max(F.col("_loan_am")).alias("max_loanamount"),
@@ -299,8 +306,9 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
 
             # active_total_cc_credit_limit → sum of orig_loan_am across ALL active CC accounts
             # = total revolving credit capacity available to the customer
-            F.sum(
-                F.when(F.col("_is_cc") & (F.col("_is_active") == 1), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_cc") & (F.col("_is_active") == 1), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("active_total_cc_credit_limit"),
         )
 
@@ -367,8 +375,9 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         #    already grouped — requires a second pass on the pre-agg df.
         #    Implemented inline using a sub-aggregation on the flagged df.
         active_exposure_df = df.groupBy(group_cols).agg(
-            F.sum(
-                F.when(F.col("_is_active") == 1, F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_active") == 1, F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_active_exposure")
         )
         feature_df = feature_df.join(active_exposure_df, on=group_cols, how="left")
@@ -377,9 +386,10 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         #    Sum of PL accounts where orig_loan_am <= 50,000.
         #    Granular small-ticket PL exposure for STPL/microfinance models.
         pl_lt50k_df = df.groupBy(group_cols).agg(
-            F.sum(
-                F.when(F.col("_is_pl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 50000),
-                       F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_pl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 50000),
+                             F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("sumloanamount_personalloan_lt_50K")
         )
         feature_df = feature_df.join(pl_lt50k_df, on=group_cols, how="left")
@@ -636,60 +646,72 @@ class HighestCreditSignalsFeatures(TradelineFeatureBase):
         )
 
         # ── STEP 7: Aggregate ─────────────────────────────────────────────────
+        # highest_credit_X features coalesced to 0 when product absent.
+        # Use companion flags (has_taken_X_ever from grp06) alongside these in models.
         feature_df = df.groupBy(group_cols).agg(
 
             # ── Requested features ────────────────────────────────────────────
 
             # Gold Loan — max sanction in last 5 years
-            F.max(
-                F.when(F.col("_is_gl") & F.col("_in_60m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_gl") & F.col("_in_60m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_gold_loan_5_years"),
 
             # Consumer Loan — max sanction in last 3 years
-            F.max(
-                F.when(F.col("_is_consumer") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_consumer") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_consumer_loan_3_years"),
 
             # Personal Loan — max sanction in last 3 years
-            F.max(
-                F.when(F.col("_is_pl") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_pl") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_personal_loan_3_years"),
 
             # Housing Loan — max sanction all-time
-            F.max(
-                F.when(F.col("_is_hl") & F.col("_alltime"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_hl") & F.col("_alltime"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_housing_loan"),
 
             # Unsecured — max sanction in last 3 years
-            F.max(
-                F.when(F.col("_is_unsecured") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_unsecured") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_unsecured_3_years"),
 
             # ── Additional risk features ──────────────────────────────────────
 
             # Auto/Vehicle Loan — max sanction in last 3 years
-            F.max(
-                F.when(F.col("_is_al") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_al") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_al_3_years"),
 
             # Credit Card — max credit limit granted in last 3 years
-            F.max(
-                F.when(F.col("_is_cc") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_cc") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_cc_3_years"),
 
             # Personal Loan — max sanction in last 5 years
-            F.max(
-                F.when(F.col("_is_pl") & F.col("_in_60m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_pl") & F.col("_in_60m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_pl_5_years"),
 
             # Any product — max sanction in last 5 years
-            F.max(
-                F.when(F.col("_in_60m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_in_60m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_any_5_years"),
 
             # Gold Loan — max sanction in last 3 years (for ratio with PL)
-            F.max(
-                F.when(F.col("_is_gl") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.max(F.when(F.col("_is_gl") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("highest_credit_gl_3_years"),
 
             # Flag: customer has ever had a Housing Loan
@@ -843,16 +865,18 @@ class LoanVolumeOverTimeFeatures(TradelineFeatureBase):
             # ── Requested ─────────────────────────────────────────────────────
 
             # Total loan amount — all products, last 12 months
-            F.sum(
-                F.when(F.col("_in_12m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_in_12m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_in_last12_mon"),
 
             # Total loan amount — all products, last 36 months
-            F.sum(
-                F.when(F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_3_years"),
 
-            # Mean unsecured loan amount — last 36 months
+            # Mean unsecured loan amount — last 36 months (stays None when absent)
             F.mean(
                 F.when(F.col("_is_unsecured") & F.col("_in_36m"), F.col("_loan_am"))
             ).alias("mean_credit_unsecured_in_3_years"),
@@ -860,36 +884,41 @@ class LoanVolumeOverTimeFeatures(TradelineFeatureBase):
             # ── Additional ────────────────────────────────────────────────────
 
             # PL sum — last 12 months (windowed; cat03 has all-time)
-            F.sum(
-                F.when(F.col("_is_pl") & F.col("_in_12m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_pl") & F.col("_in_12m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_pl_12m"),
 
             # PL sum — last 36 months (windowed; cat03 has all-time)
-            F.sum(
-                F.when(F.col("_is_pl") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_pl") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_pl_3_years"),
 
             # Unsecured sum — last 12 months
-            F.sum(
-                F.when(F.col("_is_unsecured") & F.col("_in_12m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_unsecured") & F.col("_in_12m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_unsecured_12m"),
 
             # Unsecured sum — last 36 months (denominator for ratio below)
-            F.sum(
-                F.when(F.col("_is_unsecured") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_unsecured") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_unsecured_3y"),
 
             # Secured sum — last 36 months
-            F.sum(
-                F.when(F.col("_is_secured") & F.col("_in_36m"), F.col("_loan_am"))
+            F.coalesce(
+                F.sum(F.when(F.col("_is_secured") & F.col("_in_36m"), F.col("_loan_am"))),
+                F.lit(0).cast("double")
             ).alias("total_loan_amt_secured_3_years"),
 
-            # Mean PL loan amount — last 36 months
+            # Mean PL loan amount — last 36 months (stays None when absent)
             F.mean(
                 F.when(F.col("_is_pl") & F.col("_in_36m"), F.col("_loan_am"))
             ).alias("mean_credit_pl_in_3_years"),
 
-            # Mean loan amount — all products, last 12 months
+            # Mean loan amount — all products, last 12 months (stays None when absent)
             F.mean(
                 F.when(F.col("_in_12m"), F.col("_loan_am"))
             ).alias("mean_credit_all_in_12m"),

@@ -25,14 +25,12 @@ GOLD_CODE = "191"
 GL_CODES  = {"191", "243"}
 AL_CODES  = {"47", "173", "172", "221", "222", "223", "246"}
 HL_CODES  = {"58", "195", "168", "240"}
-SPL_CODES = {"184", "185", "175", "241", "248", "181", "197", "198", "199", "200"}
 USL_CODES = {
     "123", "189", "187", "130", "242", "244", "245", "247",
     "167", "169", "170", "176", "177", "178", "179",
     "228", "227", "226", "249",
 }
 OTHER_CODES = {"999", "121", "219", "196", "215", "216", "217"}
-ALL_NAMED   = GL_CODES | AL_CODES | HL_CODES | CC_CODES | SPL_CODES | USL_CODES
 
 UNSECURED_EXCLUDE = {
     # All secured codes — excluded when counting unsecured tradelines
@@ -42,6 +40,10 @@ UNSECURED_EXCLUDE = {
     "191", "195", "197", "198", "199", "200", "219", "221",
     "222", "223", "240", "241", "243", "246", "248",
 }
+
+ALL_NAMED   = GL_CODES | AL_CODES | HL_CODES | CC_CODES | UNSECURED_EXCLUDE | USL_CODES
+
+
 
 
 def _i(cond):
@@ -126,8 +128,6 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             .withColumn("_is_gl",        F.col("_acct").isin(GL_CODES))
             .withColumn("_is_al",        F.col("_acct").isin(AL_CODES))
             .withColumn("_is_hl",        F.col("_acct").isin(HL_CODES))
-            .withColumn("_is_spl",       F.col("_acct").isin(SPL_CODES))
-            .withColumn("_is_usl",       F.col("_acct").isin(USL_CODES))
             .withColumn("_is_other",     ~F.col("_acct").isin(ALL_NAMED))
             .withColumn("_is_unsecured", ~F.col("_acct").isin(UNSECURED_EXCLUDE))
         )
@@ -170,8 +170,8 @@ class PortfolioCountsFeatures(TradelineFeatureBase):
             F.sum(_i(F.col("_active") & F.col("_is_stpl") & F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000))).alias("CountBureauActiveSTPLAccounts"),
 
             # B. Active portfolio counts by product
-            F.sum(_i(F.col("_active"))).alias("active_loans"),
-            F.sum(_i(F.col("_active") & F.col("_is_unsecured"))).alias("active_unsecured"),
+            F.sum(_i(F.col("_active"))).alias("BureauActiveTradelines"),
+            F.sum(_i(F.col("_active") & F.col("_is_unsecured"))).alias("active_usl"),
             F.sum(_i(F.col("_active") & F.col("_is_spl"))).alias("active_spl"),
             F.sum(_i(F.col("_active") & F.col("_is_cc"))).alias("active_cc"),
             F.sum(_i(F.col("_active") & F.col("_is_hl"))).alias("active_hl"),

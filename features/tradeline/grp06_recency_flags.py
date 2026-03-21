@@ -630,6 +630,36 @@ class CreditBehaviourFlagsFeatures(TradelineFeatureBase):
                 F.when(F.col("_is_cc") & F.col("_alltime"), F.lit(1))
                  .otherwise(F.lit(0))
             ).alias("_cc_count_ever"),
+
+            # ── AL flags ─────────────────────────────────────────────────────
+
+            # Active AL at as_of_dt
+            F.max(
+                F.when(F.col("_is_al") & (F.col("_is_active") == 1), F.lit(1))
+                 .otherwise(F.lit(0))
+            ).alias("has_active_al_flag"),
+
+            # Ever had AL
+            F.max(
+                F.when(F.col("_is_al") & F.col("_alltime"), F.lit(1))
+                 .otherwise(F.lit(0))
+            ).alias("has_taken_al_ever"),
+
+
+            # ── USL flags ─────────────────────────────────────────────────────
+            # USL = ~SECURED_CODES (all unsecured products: PL, CC, consumer, MFI, etc.)
+
+            # Active USL at as_of_dt
+            F.max(
+                F.when(F.col("_is_unsecured") & (F.col("_is_active") == 1), F.lit(1))
+                 .otherwise(F.lit(0))
+            ).alias("has_active_usl_flag"),
+
+            # Ever had USL
+            F.max(
+                F.when(F.col("_is_unsecured") & F.col("_alltime"), F.lit(1))
+                 .otherwise(F.lit(0))
+            ).alias("has_taken_usl_ever"),
         )
 
         # ── STEP 9: Derived flags (post-aggregation) ──────────────────────────
