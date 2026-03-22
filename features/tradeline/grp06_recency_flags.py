@@ -63,8 +63,7 @@ logger = get_logger(__name__)
 GL_CODES  = {"191", "243"}
 AL_CODES  = {"47", "173", "172", "221", "222", "223", "246"}
 HL_CODES  = {"58", "195", "168", "240"}
-CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
-SPL_CODES = {"184", "185", "175", "241", "248", "181", "197", "198", "199", "200"}
+CC_CODES  = {"5", "213", "214", "220", "224", "225"}   
 MCF_CODES = {"167", "169", "170"}          # Microfinance — Business, Personal, Other
 P2P_CODES = {"245", "246", "247"}          # P2P Personal, Auto, Education
 
@@ -227,7 +226,6 @@ class RecencyCreditActivityFeatures(TradelineFeatureBase):
             .withColumn("_is_hl",   F.col("_acct_type").isin(HL_CODES))
             .withColumn("_is_al",   F.col("_acct_type").isin(AL_CODES))
             .withColumn("_is_stpl", F.col("_acct_type") == STPL_CODE)
-            .withColumn("_is_spl",  F.col("_acct_type").isin(SPL_CODES))
             .withColumn("_is_nbfc", F.col("_lender") == NBFC_CODE)
             .withColumn("_is_pl_or_stpl",
                 (F.col("_acct_type") == PL_CODE) | (F.col("_acct_type") == STPL_CODE))
@@ -270,10 +268,6 @@ class RecencyCreditActivityFeatures(TradelineFeatureBase):
             F.min(
                 F.when(F.col("_is_stpl"), F.col("_months_since_open"))
             ).alias("months_from_last_stpl"),
-
-            F.min(
-                F.when(F.col("_is_spl"),  F.col("_months_since_open"))
-            ).alias("months_from_last_spl"),
 
             # Any product — most recently opened account of any type
             F.min(
@@ -468,6 +462,7 @@ class CreditBehaviourFlagsFeatures(TradelineFeatureBase):
             .withColumn("_is_pl",       F.col("_acct_type") == PL_CODE)
             .withColumn("_is_cc",       F.col("_acct_type").isin(CC_CODES))
             .withColumn("_is_gl",       F.col("_acct_type").isin(GL_CODES))
+            .withColumn("_is_al",       F.col("_acct_type").isin(AL_CODES))
             .withColumn("_is_hl",       F.col("_acct_type").isin(HL_CODES))
             .withColumn("_is_stpl",     F.col("_acct_type") == STPL_CODE)
             .withColumn("_is_mcf",      F.col("_acct_type").isin(MCF_CODES))

@@ -199,7 +199,6 @@ class LenderTypeMixFeatures(TradelineFeatureBase):
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
-        # ── STEP 1: Parse date columns ────────────────────────────────────────
 
         df = (
             df
@@ -406,10 +405,6 @@ class LenderTypeMixFeatures(TradelineFeatureBase):
             # Unsecured loans from banks — 3y
             F.sum(F.when(F.col("_is_bank") & F.col("_is_unsecured_prod") & F.col("_in_36m"), F.lit(1)).otherwise(F.lit(0))
             ).alias("count_unsecured_loans_from_bank_3y"),
-
-            # Secured loans from HFC — all-time (housing finance = almost always secured)
-            F.sum(F.when(F.col("_is_sfb") & F.col("_alltime"), F.lit(1)).otherwise(F.lit(0))
-            ).alias("count_accounts_hfc"),
 
             # Total secured accounts — 3y (denominator)
             F.sum(F.when(F.col("_is_secured_prod") & F.col("_in_36m"), F.lit(1)).otherwise(F.lit(0))

@@ -240,14 +240,51 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
 
     @staticmethod
     def _missed_payment_freq_col(window: int, product_filter=None) -> F.Column:
-        """Per-row missed payment frequency ratio for window W using past_due_am history."""
+        """
+        Per-row missed payment frequency ratio for window W using past_due_am history.
+
+        Slot resolution (idx 0..36, where idx=0 is past_due_am itself):
+          slot idx = past_due at (balance_dt - idx months)
+          _md = ceil(months_between(as_of_dt, balance_dt))
+
+        CASE A — _md <= 0 (as_of_dt <= balance_dt, no gap):
+          as_of_dt falls at slot (-_md).
+          Window covers slots [-_md .. -_md+W-1].
+          All W months are available in history.
+
+        CASE B — _md > 0 (as_of_dt > balance_dt, gap of _md months):
+          The _md months between balance_dt and as_of_dt have no history.
+          slot 0 (past_due_am) = balance_dt = as_of_dt - _md months.
+          Window covers:
+            positions 1.._md       → gap (NULL, not in history)
+            position  _md+1        → slot 0 = past_due_am
+            positions _md+2.._md+k → slots 1..k-1
+          Valid slots in 0..36: [0 .. W-_md-1]  when W > _md, else NULL.
+        """
         indicators = []
-        for idx in range(1, N_HISTORY + 1):
-            col = PDU_COLS[idx - 1]
-            in_window = (F.col("_md") <= F.lit(idx)) & (F.col("_md") + F.lit(window - 1) >= F.lit(idx))
+        # idx=0 → past_due_am (slot 0 = balance_dt month)
+        # idx=1..36 → past_due_am_01..36
+        for idx in range(0, N_HISTORY + 1):
+            col_name = ALL_PDU_COLS[idx]  # index 0="past_due_am", 1="past_due_am_01", ...
+
+            # CASE A: _md <= 0  → start slot = -_md, window = [-_md .. -_md+W-1]
+            in_window_a = (
+                (F.col("_md") <= F.lit(0)) &
+                (F.lit(idx) >= -F.col("_md")) &
+                (F.lit(idx) <= -F.col("_md") + F.lit(window - 1))
+            )
+            # CASE B: _md > 0  → valid slots 0 .. W-_md-1  (when W > _md)
+            in_window_b = (
+                (F.col("_md") > F.lit(0)) &
+                (F.col("_md") < F.lit(window)) &
+                (F.lit(idx) >= F.lit(0)) &
+                (F.lit(idx) <= F.lit(window) - F.col("_md") - F.lit(1))
+            )
+            in_window = in_window_a | in_window_b
+
             flag = F.when(
                 in_window,
-                F.when(F.col(col).cast("double") > 0, F.lit(1.0)).otherwise(F.lit(0.0))
+                F.when(F.col(col_name).cast("double") > 0, F.lit(1.0)).otherwise(F.lit(0.0))
             ).otherwise(F.lit(None).cast("double"))
             if product_filter is not None:
                 flag = F.when(product_filter, flag).otherwise(F.lit(None).cast("double"))
@@ -263,19 +300,40 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
         """
         Per-slot CC utilization = balance_am_NN / credit_limit_am_NN.
 
-        Uses matching history columns for BOTH balance AND credit limit,
-        so utilization is computed at the same point-in-time as the balance.
-        Slot is only valid when:
-          - slot is within the window for this row (as_of relative to balance_dt)
-          - balance_am_NN is non-null and >= 0
-          - credit_limit_am_NN is non-null and > 0
-        NULL → no data for that slot (gap or beyond window)
+        Slot resolution (idx 0..36):
+          slot idx = balance at (balance_dt - idx months)
+          _md = ceil(months_between(as_of_dt, balance_dt))
+
+        CASE A — _md <= 0 (as_of_dt <= balance_dt, no gap):
+          Window covers slots [-_md .. -_md+W-1].
+
+        CASE B — _md > 0 (as_of_dt > balance_dt, gap of _md months):
+          Gap months have no data (NULL).
+          Valid slots: [0 .. W-_md-1]  when W > _md, else all NULL.
+          slot 0 = balance_am / credit_limit_am (the balance_dt month itself).
         """
         slots = []
-        for idx in range(1, N_HISTORY + 1):
-            bal_col = BAL_COLS[idx - 1]
-            cl_col  = CL_COLS[idx - 1]
-            in_window = (F.col("_md") <= F.lit(idx)) & (F.col("_md") + F.lit(window - 1) >= F.lit(idx))
+        # idx=0 → balance_am / credit_limit_am
+        # idx=1..36 → balance_am_01..36 / credit_limit_am_01..36
+        for idx in range(0, N_HISTORY + 1):
+            bal_col = ALL_BAL_COLS[idx]  # 0="balance_am", 1="balance_am_01", ...
+            cl_col  = ALL_CL_COLS[idx]   # 0="credit_limit_am", 1="credit_limit_am_01", ...
+
+            # CASE A: _md <= 0
+            in_window_a = (
+                (F.col("_md") <= F.lit(0)) &
+                (F.lit(idx) >= -F.col("_md")) &
+                (F.lit(idx) <= -F.col("_md") + F.lit(window - 1))
+            )
+            # CASE B: _md > 0
+            in_window_b = (
+                (F.col("_md") > F.lit(0)) &
+                (F.col("_md") < F.lit(window)) &
+                (F.lit(idx) >= F.lit(0)) &
+                (F.lit(idx) <= F.lit(window) - F.col("_md") - F.lit(1))
+            )
+            in_window = in_window_a | in_window_b
+
             bal = F.when(F.col(bal_col).cast("double") >= 0,
                          F.col(bal_col).cast("double")).otherwise(F.lit(None).cast("double"))
             cl  = F.when(F.col(cl_col).cast("double") > 0,

@@ -48,7 +48,7 @@ logger = get_logger(__name__)
 
 PL_ENQ_CODES   = {"13"}                          # Personal Loan enquiry
 CC_ENQ_CODES   = {"7"}                           # Credit Card enquiry
-UNSECURED_ENQ  = {"13", "11", "18", "8"}         # PL + MFI + Consumer + Education
+UNSECURED_ENQ  = {"13", "11", "18", "8","7"}         # PL + MFI + Consumer + Education
 SECURED_ENQ    = {"1", "2", "4", "5", "10", "14", "16"}  # Agri/Auto/CV/Equip/Collateral/Property/2W3W
 BUSINESS_ENQ   = {"3", "17", "12"}               # Business/Working Capital/Non-Funded
 

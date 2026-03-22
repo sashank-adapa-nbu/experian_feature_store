@@ -116,6 +116,11 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
 
     Staleness NULL rule: if month_diff > window_size → entire window = NULL.
     Missed payment: payment amount <= 0 for a valid (non-NULL) slot.
+
+    Payment sum (payments_X_month): cumulative sum of ALL non-null payment
+    slots per account in the window, then summed across all accounts.
+    Payment frequency (frequency_of_payments_Xm): count of reported months
+    (non-null slots) per account summed across all accounts.
     """
 
     CATEGORY = "grp08a_payment_behaviour"
@@ -235,7 +240,26 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
         w6_pl_gt30k  = self._window(6,  active_filter=active_pl_gt30k)
         w12_pl_gt30k = self._window(12, active_filter=active_pl_gt30k)
 
+        # ── helper: cumulative sum of all non-null slots in a window ────────
+        # Used for payments_X_month: sums EVERY non-null payment slot per account
+        # (i.e. all months that have a reported payment), then aggregates across accounts.
+        # guard: F.greatest(*slots).isNotNull() ensures accounts with ALL-NULL slots
+        # (no reporting data in window) contribute nothing rather than 0.
+        def win_sum(slots) -> F.Column:
+            """Cumulative sum of all non-null payment amounts in window per row."""
+            slot_sum = sum(F.coalesce(s, F.lit(0.0)) for s in slots)
+            return F.when(F.greatest(*slots).isNotNull(), slot_sum)
+
+        def win_freq(slots) -> F.Column:
+            """Count of months with a reported (non-null) payment in window per row."""
+            slot_count = sum(
+                F.when(s.isNotNull(), F.lit(1)).otherwise(F.lit(0)) for s in slots
+            )
+            return F.when(F.greatest(*slots).isNotNull(), slot_count)
+
         # ── helper: missed payment count over a window ────────────────────────
+        # missed = slot is non-null AND payment <= 0 (zero or negative = no payment made)
+        # Uses F.coalesce(*slots) → first non-null slot as the representative value.
         def missed(slots):
             return F.sum(F.when(
                 F.coalesce(*slots).isNotNull() & (F.coalesce(*slots) <= 0),
@@ -252,14 +276,19 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
         feature_df = df.groupBy(group_cols).agg(
 
             # ── Windowed payment sums — all accounts ─────────────────────────
-            # Null-aware payment sums:
-            # Sum only non-null payment slots; NULL if entire window has no reporting data
-            F.sum(F.when(F.greatest(*w3).isNotNull(),
-                         F.coalesce(*w3, F.lit(0.0)))).alias("payments_3_month"),
-            F.sum(F.when(F.greatest(*w6).isNotNull(),
-                         F.coalesce(*w6, F.lit(0.0)))).alias("payments_6_month"),
-            F.sum(F.when(F.greatest(*w12).isNotNull(),
-                         F.coalesce(*w12, F.lit(0.0)))).alias("payments_12_month"),
+            # Cumulative sum: sum ALL non-null payment slots per account per window.
+            # Example: CC with md=1, W=3 → [NULL, 3774, 4072] → contributes 3774+4072=7846
+            # Accounts with ALL-NULL slots in window are excluded (no reporting data).
+            F.sum(win_sum(w3)).alias("payments_3_month"),
+            F.sum(win_sum(w6)).alias("payments_6_month"),
+            F.sum(win_sum(w12)).alias("payments_12_month"),
+
+            # ── Frequency of payments in window — count of months with a payment ─
+            # = count of non-null (reported) slots per account summed across all accounts
+            # Useful for understanding payment regularity within the window.
+            F.sum(win_freq(w3)).alias("frequency_of_payments_3m"),
+            F.sum(win_freq(w6)).alias("frequency_of_payments_6m"),
+            F.sum(win_freq(w12)).alias("frequency_of_payments_12m"),
 
             # ── Active CC repayment features ──────────────────────────────────
             # MAX/MIN across all available payment slots in window
@@ -322,18 +351,32 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
             # Max single payment in last 12m — ability-to-pay signal
             F.max(F.greatest(*w12)).alias("max_payment_last_12m"),
 
-            # Mean payment in last 12m — consistency signal
-            F.mean(F.coalesce(*w12)).alias("mean_payment_last_12m"),
+            # Mean payment in last 12m — mean of ALL non-null slot values across all accounts
+            # = total cumulative payments / total count of reported months
+            # More accurate than mean(coalesce) which only used the first slot per account.
+            F.sum(win_sum(w12)).alias("_pmt_sum_all_12m"),
+            F.sum(win_freq(w12)).alias("_pmt_freq_all_12m"),
 
-            # For ratio feature
-            F.sum(F.coalesce(*w3,  F.lit(None).cast("double"))).alias("_pmt_sum_3m"),
-            F.sum(F.coalesce(*w12, F.lit(None).cast("double"))).alias("_pmt_sum_12m"),
+            # For ratio feature — uses cumulative sums (consistent with payments_X_month)
+            F.sum(win_sum(w3)).alias("_pmt_sum_3m"),
+            F.sum(win_sum(w12)).alias("_pmt_sum_12m"),
         )
 
-        # ── STEP 7: Derived ratio features ───────────────────────────────────
+        # ── STEP 7: Derived features ─────────────────────────────────────────
+
+        # mean_payment_last_12m = total payments in 12m / count of reported months
+        # Computed post-aggregation from the cumulative sum and frequency intermediates.
+        feature_df = feature_df.withColumn(
+            "mean_payment_last_12m",
+            F.when(
+                F.col("_pmt_freq_all_12m").isNotNull() & (F.col("_pmt_freq_all_12m") > 0),
+                F.col("_pmt_sum_all_12m") / F.col("_pmt_freq_all_12m")
+            ).otherwise(F.lit(None).cast("double"))
+        )
 
         # ratio_payment_3m_to_12m
-        # Low → payments declining recently (risk signal)
+        # Uses cumulative sums → reflects actual payment volume trend.
+        # Low → payments declining recently (risk signal).
         feature_df = feature_df.withColumn(
             "ratio_payment_3m_to_12m",
             F.when(
@@ -342,7 +385,10 @@ class PaymentBehaviourFeatures(TradelineFeatureBase):
             ).otherwise(F.lit(None).cast("double"))
         )
 
-        feature_df = feature_df.drop("_pmt_sum_3m", "_pmt_sum_12m")
+        feature_df = feature_df.drop(
+            "_pmt_sum_3m", "_pmt_sum_12m",
+            "_pmt_sum_all_12m", "_pmt_freq_all_12m"
+        )
 
         self._log_done(feature_df)
         return feature_df

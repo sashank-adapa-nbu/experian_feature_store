@@ -220,6 +220,7 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
             .withColumn("_is_hl",        F.col("_acct_type").isin(HL_CODES))
             .withColumn("_is_cc",        F.col("_acct_type").isin(CC_CODES))
             .withColumn("_is_other",    ~F.col("_acct_type").isin(ALL_NAMED_CODES))
+            # Secured/unsecured split using full SECURED_CODES set (Appendix A verified)
             .withColumn("_is_secured",   F.col("_acct_type").isin(SECURED_CODES))
             .withColumn("_is_unsecured", ~F.col("_acct_type").isin(SECURED_CODES))
         )
@@ -338,10 +339,11 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         # 3. flag_stpl_only
         #    Customer's entire credit history is sub-30K STPLs → thin/NTC segment.
         #    1 = stpl seen AND overall max loan is also within 30K band
+        #    NOTE: MaxLoanAmountTotalSTPL is coalesced to 0 when absent, so check > 0 not isNotNull
         feature_df = feature_df.withColumn(
             "flag_stpl_only",
             F.when(
-                F.col("MaxLoanAmountTotalSTPL").isNotNull() &
+                (F.col("MaxLoanAmountTotalSTPL") > 0) &
                 (F.col("max_loanamount") <= 30000),
                 F.lit(1)
             ).otherwise(F.lit(0))
@@ -350,21 +352,22 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         # 4. flag_high_value_hl
         #    Home loan ≥ 25 lakh → higher income/asset segment.
         #    Strong negative (protective) risk signal in PL/STPL models.
+        #    NOTE: max_loanamount_hl is coalesced to 0 when absent, so check >= threshold directly
         feature_df = feature_df.withColumn(
             "flag_high_value_hl",
             F.when(
-                F.col("max_loanamount_hl").isNotNull() & (F.col("max_loanamount_hl") >= 2500000),
+                F.col("max_loanamount_hl") >= 2500000,
                 F.lit(1)
             ).otherwise(F.lit(0))
         )
 
         # 5. flag_has_large_pl
         #    Active PL ≥ 5 lakh → high income OR over-leverage signal.
+        #    NOTE: MaxLoanAmountActivePersonalLoan is coalesced to 0 when absent, check > threshold
         feature_df = feature_df.withColumn(
             "flag_has_large_pl",
             F.when(
-                F.col("MaxLoanAmountActivePersonalLoan").isNotNull() &
-                (F.col("MaxLoanAmountActivePersonalLoan") >= 500000),
+                F.col("MaxLoanAmountActivePersonalLoan") >= 500000,
                 F.lit(1)
             ).otherwise(F.lit(0))
         )
@@ -408,11 +411,12 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         # 9. flag_stpl_active_and_inactive
         #    1 = customer has both open AND closed STPLs → experienced STPL borrower.
         #    0 = either never had STPL, or only active, or only closed ones.
+        #    NOTE: both STPL amounts are coalesced to 0 when absent, so check > 0 not isNotNull
         feature_df = feature_df.withColumn(
             "flag_stpl_active_and_inactive",
             F.when(
-                F.col("MaxLoanAmountActiveSTPL").isNotNull() &
-                F.col("MaxLoanAmountInactiveSTPL").isNotNull(),
+                (F.col("MaxLoanAmountActiveSTPL") > 0) &
+                (F.col("MaxLoanAmountInactiveSTPL") > 0),
                 F.lit(1)
             ).otherwise(F.lit(0))
         )
@@ -420,14 +424,15 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         # 10. flag_pure_unsecured_customer
         #     1 = has unsecured loans AND no secured / HL / AL / GL exposure at all.
         #     Warrants separate scorecard treatment in risk models.
+        #     NOTE: all max amounts are coalesced to 0 when absent, so check == 0 not isNull
         feature_df = feature_df.withColumn(
             "flag_pure_unsecured_customer",
             F.when(
-                F.col("max_loanamount_usl").isNotNull() &
-                F.col("max_loanamount_sl").isNull() &
-                F.col("max_loanamount_hl").isNull() &
-                F.col("max_loanamount_al").isNull() &
-                F.col("max_loanamount_gl").isNull(),
+                (F.col("max_loanamount_usl") > 0) &
+                (F.col("max_loanamount_sl") == 0) &
+                (F.col("max_loanamount_hl") == 0) &
+                (F.col("max_loanamount_al") == 0) &
+                (F.col("max_loanamount_gl") == 0),
                 F.lit(1)
             ).otherwise(F.lit(0))
         )
@@ -952,5 +957,3 @@ class LoanVolumeOverTimeFeatures(TradelineFeatureBase):
 
         self._log_done(feature_df)
         return feature_df
-
-
