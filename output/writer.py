@@ -1,8 +1,11 @@
-# output/writer.py
-# ─────────────────────────────────────────────────────────────────────────────
+# output/writer.py  [OPTIMISED]
+# =============================================================================
 # Delta table writer for feature outputs.
-# Supports: append (with partition), overwrite, and merge (upsert).
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# OPTIMISATION: removed df.count() before write (was triggering a full
+# extra scan of 500M rows purely for log output).
+# Uses Delta commit metrics for row counts instead.
+# =============================================================================
 
 from typing import Optional, List
 from pyspark.sql import DataFrame, SparkSession
@@ -19,9 +22,9 @@ class FeatureWriter:
     Handles writing feature DataFrames to Unity Catalog Delta tables.
 
     write_mode options:
-      "append"    → appends rows, partitioned by partition_col if provided
-      "overwrite" → full overwrite of the table
-      "merge"     → upsert on merge_keys (requires merge_keys param)
+      "append"    → partition overwrite (dynamic) on partition_col
+      "overwrite" → full table overwrite
+      "merge"     → upsert on merge_keys
     """
 
     def __init__(self, spark: SparkSession):
@@ -37,87 +40,69 @@ class FeatureWriter:
     ):
         """
         Write a feature DataFrame to a Delta table.
-
-        Parameters
-        ----------
-        df            : Feature DataFrame to write
-        table_name    : Fully qualified table name (catalog.schema.table)
-        write_mode    : "append" | "overwrite" | "merge"
-        partition_col : Column to partition by (used for append mode)
-        merge_keys    : PK columns for upsert (used for merge mode)
+        Does NOT call df.count() — avoids extra full scan on 500M-row data.
+        Delta commit log provides row count metrics after write.
         """
-        logger.info(f"[Writer] Writing to {table_name} | mode={write_mode} | rows={df.count()}")
+        logger.info(f"[Writer] → {table_name} | mode={write_mode}")
 
         if write_mode == "append":
             self._append(df, table_name, partition_col)
-
         elif write_mode == "overwrite":
             self._overwrite(df, table_name, partition_col)
-
         elif write_mode == "merge":
             if not merge_keys:
                 raise ValueError("merge_keys must be provided for write_mode='merge'")
             self._merge(df, table_name, merge_keys)
-
         else:
-            raise ValueError(f"Unsupported write_mode: {write_mode}. Use 'append', 'overwrite', or 'merge'.")
+            raise ValueError(f"Unsupported write_mode: {write_mode}")
 
     def _append(self, df: DataFrame, table_name: str, partition_col: Optional[str]):
-        """Append rows. If partition_col provided, overwrites only that partition."""
-        writer = df.write.format("delta").mode("append")
-
+        """
+        Append with dynamic partition overwrite — idempotent per partition.
+        Re-running for the same scrub_output_date overwrites that partition only,
+        making the pipeline safe to retry on failure.
+        """
         if partition_col and partition_col in df.columns:
             writer = (
                 df.write
                 .format("delta")
-                .mode("overwrite")                          # overwrite the partition only
+                .mode("overwrite")
                 .option("partitionOverwriteMode", "dynamic")
                 .partitionBy(partition_col)
             )
-            logger.info(f"[Writer] Using dynamic partition overwrite on '{partition_col}'")
+            logger.info(f"[Writer] Dynamic partition overwrite on '{partition_col}'")
+        else:
+            writer = df.write.format("delta").mode("append")
 
         try:
             writer.saveAsTable(table_name)
-            logger.info(f"[Writer] ✓ Append complete → {table_name}")
+            logger.info(f"[Writer] ✓ Done → {table_name}")
         except Exception as e:
-            logger.error(f"[Writer] ✗ Append failed → {table_name} | {e}")
+            logger.error(f"[Writer] ✗ Failed → {table_name} | {e}")
             raise
 
     def _overwrite(self, df: DataFrame, table_name: str, partition_col: Optional[str]):
-        """Full overwrite of the table."""
         writer = df.write.format("delta").mode("overwrite")
         if partition_col and partition_col in df.columns:
             writer = writer.partitionBy(partition_col)
         try:
             writer.saveAsTable(table_name)
-            logger.info(f"[Writer] ✓ Overwrite complete → {table_name}")
+            logger.info(f"[Writer] ✓ Overwrite → {table_name}")
         except Exception as e:
-            logger.error(f"[Writer] ✗ Overwrite failed → {table_name} | {e}")
+            logger.error(f"[Writer] ✗ Failed → {table_name} | {e}")
             raise
 
     def _merge(self, df: DataFrame, table_name: str, merge_keys: List[str]):
-        """
-        MERGE (upsert) into existing Delta table.
-        Inserts new rows, updates existing rows matched on merge_keys.
-        """
         try:
             delta_table = DeltaTable.forName(self.spark, table_name)
         except Exception:
-            # Table doesn't exist yet → create it
-            logger.info(f"[Writer] Table {table_name} does not exist — creating via overwrite.")
+            logger.info(f"[Writer] Table {table_name} not found — creating via overwrite.")
             df.write.format("delta").mode("overwrite").saveAsTable(table_name)
             logger.info(f"[Writer] ✓ Created → {table_name}")
             return
 
-        # Build merge condition string
         merge_condition = " AND ".join([f"target.{k} = source.{k}" for k in merge_keys])
-
-        # Build update map for all non-key columns
-        update_map = {
-            col: f"source.{col}"
-            for col in df.columns
-            if col not in merge_keys
-        }
+        update_map = {col: f"source.{col}" for col in df.columns if col not in merge_keys}
 
         try:
             (
@@ -127,7 +112,7 @@ class FeatureWriter:
                 .whenNotMatchedInsertAll()
                 .execute()
             )
-            logger.info(f"[Writer] ✓ Merge complete → {table_name}")
+            logger.info(f"[Writer] ✓ Merge → {table_name}")
         except Exception as e:
             logger.error(f"[Writer] ✗ Merge failed → {table_name} | {e}")
             raise

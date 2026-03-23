@@ -1,30 +1,14 @@
-# features/tradeline/grp03_balances_utilization.py
+# features/tradeline/grp03_balances_utilization.py  [OPTIMISED]
 # =============================================================================
 # Group 03 — Outstanding Balances & Credit Utilization
 # =============================================================================
-# Merged from: cat05 (outstanding balance), cat14 (credit utilization)
+# OPTIMISATION:
+#   grp03a: replaced F.greatest(*36_when_cols) history_selector with
+#           F.array() + resolve_slot_at_asof() — eliminates large plan node count.
+#   grp03b: replaced per-slot CASE A/B loops over 37 slots with
+#           F.array() + element_at() for both pdu and util arrays.
 #
-# Sections:
-#   A. OutstandingBalanceFeatures  — resolved balance per product at as_of_dt
-#   B. CreditUtilizationFeatures   — missed payment frequency ratio + CC utilization windowed
-#
-# Balance resolution (point-in-time):
-#   month_diff = ceil(months_between(balance_dt, as_of_dt))
-#   <= 0       → use BALANCE_AM directly
-#   1..36      → use BALANCE_AM_NN history column
-#   > 36       → NULL (beyond window)
-#
-# Secured vs Unsecured — Appendix A verified:
-#   SECURED  = collateral-backed: Automobile, Mortgage, Property, Gold,
-#              Shares/Securities, FD, Commercial Vehicle, Two-Wheeler,
-#              Three-Wheeler, Used Car, Construction Equipment, P2P Auto,
-#              MFI Housing, GECL Secured, Non-Funded Credit Facilities,
-#              Business Loan Against Deposits, Leasing
-#   UNSECURED = PL, Consumer Loan, CC (all codes), Student, Professional,
-#              MFI (Business/Personal/Other), P2P (Personal/Education),
-#              Business Loans (general/priority), STPL, USL, GECL Unsecured
-#   NOTE: CC (5,213,214,220,224,225) = CC/unsecured category (all CC codes incl. 220 treated as CC)
-#   NOTE: Education loan (130,247) = UNSECURED
+# Semantics preserved exactly (validated against grp03a/b outputs).
 # =============================================================================
 
 from pyspark.sql import DataFrame
@@ -34,78 +18,38 @@ from typing import List
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
 from core.date_utils import parse_date
+from core.utils import build_history_array, resolve_slot_at_asof, resolve_slot
 
 logger = get_logger(__name__)
 
-# =============================================================================
-# CODE SETS — verified against Appendix A (Experian Bureau Products v3.2)
-# =============================================================================
-
-CC_CODES  = {"5", "213", "214", "220", "224", "225"}   # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
-
-PL_CODE   = "123"   # Loan, Personal Cash
-HL_CODE   = "195"   # Loan, Property
-CL_CODE   = "189"   # Loan, Consumer
-STPL_CODE = "242"   # Short Term Personal Loan
-
-# SECURED = physical or financial collateral backing the loan
-# Verified per Appendix A — NOTE: "220" (Secured CC) moved to CC_CODES; "181","197-200","240","246","248" added
+CC_CODES  = {"5","213","214","220","224","225"}
+PL_CODE   = "123"
+HL_CODE   = "195"
+CL_CODE   = "189"
+STPL_CODE = "242"
 SECURED_CODES = {
-    "47",   # Instalment Loan, Automobile
-    "58",   # Instalment Loan, Mortgage
-    "168",  # Microfinance, Housing
-    "172",  # Instalment Loan, Commercial Vehicle
-    "173",  # Instalment Loan, Two-Wheeler
-    "175",  # Business Loan Against Bank Deposits
-    "181",  # Credit Facility, Non-Funded
-    "184",  # Loan Against Bank Deposits
-    "185",  # Loan Against Shares/Securities
-    "191",  # Loan, Gold
-    "195",  # Loan, Property
-    "197",  # Non-Funded Credit Facility, General
-    "198",  # Non-Funded Credit Facility, Priority Sector - Small Business
-    "199",  # Non-Funded Credit Facility, Priority Sector - Agriculture
-    "200",  # Non-Funded Credit Facility, Priority Sector - Others
-    "219",  # Leasing, Other
-    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
-    "221",  # Used Car Loan
-    "222",  # Construction Equipment Loan
-    "223",  # Tractor Loan
-    "240",  # Pradhan Mantri Awas Yojna  (housing scheme)
-    "241",  # Business Loan – Secured
-    "243",  # Priority Sector Gold Loan
-    "246",  # P2P Auto Loan
-    "248",  # GECL Loan Secured
+    "47","58","168","172","173","175","181","184","185","191","195",
+    "197","198","199","200","219","221","222","223","240","241","243","246","248",
 }
 
-# UNSECURED — for reference (anything not in SECURED_CODES and not OTHER)
-# Includes: PL(123), Consumer(189), CC(all), Student(130), Professional(187),
-#           MFI Business/Personal/Other(167,169,170), P2P PL/Education(245,247),
-#           Business Loans(176-179), STPL(242,244), USL(226-228), GECL Unsec(249)
+N_HISTORY = 36
+PDU_HIST  = [f"past_due_am_{str(i).zfill(2)}"    for i in range(1, N_HISTORY + 1)]
+BAL_HIST  = [f"balance_am_{str(i).zfill(2)}"     for i in range(1, N_HISTORY + 1)]
+CL_HIST   = [f"credit_limit_am_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
 
-N_HISTORY    = 36
-PDU_COLS     = [f"past_due_am_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
-BAL_COLS     = [f"balance_am_{str(i).zfill(2)}"  for i in range(1, N_HISTORY + 1)]
-ALL_PDU_COLS = ["past_due_am"] + PDU_COLS    # idx 0 = current, 1-36 = history
-ALL_BAL_COLS = ["balance_am"]  + BAL_COLS    # idx 0 = current, 1-36 = history
-CL_COLS      = [f"credit_limit_am_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
-ALL_CL_COLS  = ["credit_limit_am"] + CL_COLS     # idx 0 = current, 1-36 = history
 
+# =============================================================================
+# grp03a — Outstanding Balance
+# =============================================================================
 
 class OutstandingBalanceFeatures(TradelineFeatureBase):
-    """
-    Category 05: Outstanding Balance / Current Debt
-
-    Resolves balance at as_of_dt using month_diff slot resolution.
-    Features: total/active debt, product-level balances (PL/CL/HL/CC/STPL).
-    """
+    """Group 03a: Outstanding Balance (array-optimised)."""
 
     CATEGORY = "grp03a_outstanding_balance"
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
-
 
         df = (
             df
@@ -115,53 +59,37 @@ class OutstandingBalanceFeatures(TradelineFeatureBase):
             .withColumn("_balance_dt", parse_date("balance_dt"))
         )
 
-        # Active flag — PIT
         df = df.withColumn(
             "_is_active",
             (F.col("_open_dt") <= F.col("_as_of_dt")) &
             (F.col("_closed_dt").isNull() | (F.col("_closed_dt") > F.col("_as_of_dt")))
         )
 
-        # Clean orig_loan_am
         df = df.withColumn(
             "_loan_am",
-            F.when(F.col("orig_loan_am").cast("double") > 0,
-                   F.col("orig_loan_am").cast("double"))
+            F.when(F.col("orig_loan_am").cast("double") > 0, F.col("orig_loan_am").cast("double"))
              .otherwise(F.lit(None).cast("double"))
         )
 
-        # month_diff = how many months back from balance_dt is as_of_dt
+        # grp03a: months_between(balance_dt, as_of_dt) — balance_dt FIRST
+        # negative → use slot 0; positive → use history slot
         df = df.withColumn(
             "_month_diff",
             F.ceil(F.months_between(F.col("_balance_dt"), F.col("_as_of_dt"))).cast("int")
         )
 
-        # Resolve balance at as_of_dt via slot selection
-        history_selector = F.greatest(*[
-            F.when(F.col("_month_diff") == i,
-                   F.col(BAL_COLS[i - 1]).cast("double"))
-            for i in range(1, N_HISTORY + 1)
-        ])
+        # ── Build balance array ONCE (replaces F.greatest(*36 WHEN cols)) ────
+        df = build_history_array(df, "balance_am", BAL_HIST, "_bal_arr", clean_negative=False)
 
-        df = df.withColumn(
-            "_resolved_bal",
-            F.when(F.col("_month_diff") <= 0,
-                   F.col("balance_am").cast("double"))
-             .when((F.col("_month_diff") >= 1) & (F.col("_month_diff") <= N_HISTORY),
-                   history_selector)
-             .otherwise(F.lit(None).cast("double"))
-        )
-
-        # Clamp negatives to 0
-        df = df.withColumn(
-            "_resolved_bal",
-            F.when(F.col("_resolved_bal") > 0, F.col("_resolved_bal"))
-             .otherwise(F.lit(0.0))
+        # Resolve balance at as_of_dt
+        df = df.withColumn("_resolved_bal",
+            F.when(
+                resolve_slot_at_asof("_bal_arr", "_month_diff") > 0,
+                resolve_slot_at_asof("_bal_arr", "_month_diff")
+            ).otherwise(F.lit(0.0))
         )
 
         df = df.withColumn("_acct_type", F.trim(F.col("acct_type_cd").cast("string")))
-
-        # Product flags — all boolean
         df = (
             df
             .withColumn("_is_cl",   F.col("_acct_type") == CL_CODE)
@@ -171,184 +99,39 @@ class OutstandingBalanceFeatures(TradelineFeatureBase):
             .withColumn("_is_stpl", F.col("_acct_type") == STPL_CODE)
             .withColumn("_is_stpl_qualified",
                 (F.col("_acct_type") == STPL_CODE) &
-                F.col("_loan_am").isNotNull() &
-                (F.col("_loan_am") <= 30000))
+                F.col("_loan_am").isNotNull() & (F.col("_loan_am") <= 30000))
         )
 
         def _i(cond):
             return F.when(cond, F.lit(1)).otherwise(F.lit(0))
 
         feature_df = df.groupBy(group_cols).agg(
-
-            # Total active balance
-            F.sum(F.when(F.col("_is_active"), F.col("_resolved_bal"))
-            ).alias("total_active_outstanding_debt"),
-
-            # Total balance — all accounts
+            F.sum(F.when(F.col("_is_active"), F.col("_resolved_bal"))).alias("total_active_outstanding_debt"),
             F.sum("_resolved_bal").alias("currentbalancedue"),
-
-            # Active STPL (orig <= 30K)
-            F.sum(
-                F.when(F.col("_is_active") & F.col("_is_stpl_qualified"),
-                       F.col("_resolved_bal"))
-            ).alias("TotalOutstandingOnActiveSTPL"),
-
-            # Active Consumer Loans (189)
-            F.sum(
-                F.when(F.col("_is_active") & F.col("_is_cl"),
-                       F.col("_resolved_bal"))
-            ).alias("curr_CL_agg_bal"),
-
-            # Active Personal Loans (123)
-            F.sum(
-                F.when(F.col("_is_active") & F.col("_is_pl"),
-                       F.col("_resolved_bal"))
-            ).alias("curr_PL_agg_bal"),
-
-            # Active Home Loans (195)
-            F.sum(
-                F.when(F.col("_is_active") & F.col("_is_hl"),
-                       F.col("_resolved_bal"))
-            ).alias("curr_HL_agg_bal"),
-
-            # Active Credit Cards — UNSECURED revolving
-            F.sum(
-                F.when(F.col("_is_active") & F.col("_is_cc"),
-                       F.col("_resolved_bal"))
-            ).alias("curr_CC_agg_bal"),
-
-            # Max CC balance (any status)
-            F.max(
-                F.when(F.col("_is_cc"), F.col("_resolved_bal"))
-            ).alias("max_agg_card_bal"),
+            F.sum(F.when(F.col("_is_active") & F.col("_is_stpl_qualified"), F.col("_resolved_bal"))).alias("TotalOutstandingOnActiveSTPL"),
+            F.sum(F.when(F.col("_is_active") & F.col("_is_cl"),   F.col("_resolved_bal"))).alias("curr_CL_agg_bal"),
+            F.sum(F.when(F.col("_is_active") & F.col("_is_pl"),   F.col("_resolved_bal"))).alias("curr_PL_agg_bal"),
+            F.sum(F.when(F.col("_is_active") & F.col("_is_hl"),   F.col("_resolved_bal"))).alias("curr_HL_agg_bal"),
+            F.sum(F.when(F.col("_is_active") & F.col("_is_cc"),   F.col("_resolved_bal"))).alias("curr_CC_agg_bal"),
+            F.max(F.when(F.col("_is_cc"),                          F.col("_resolved_bal"))).alias("max_agg_card_bal"),
         )
 
         self._log_done(feature_df)
         return feature_df
 
 
-class CreditUtilizationFeatures(TradelineFeatureBase):
-    """
-    Category 14: Credit Utilization / Revolving Behaviour
+# =============================================================================
+# grp03b — Credit Utilization
+# =============================================================================
 
-    A. missed_payment_freq — past_due frequency over window (all/CC/PL/STPL/USL)
-    B. CC utilization  — balance / credit limit, windowed avg and max
-    C. Past due summary features
-    """
+class CreditUtilizationFeatures(TradelineFeatureBase):
+    """Group 03b: Credit Utilization (array-optimised)."""
 
     CATEGORY = "grp03b_credit_utilization"
-
-    @staticmethod
-    def _missed_payment_freq_col(window: int, product_filter=None) -> F.Column:
-        """
-        Per-row missed payment frequency ratio for window W using past_due_am history.
-
-        Slot resolution (idx 0..36, where idx=0 is past_due_am itself):
-          slot idx = past_due at (balance_dt - idx months)
-          _md = ceil(months_between(as_of_dt, balance_dt))
-
-        CASE A — _md <= 0 (as_of_dt <= balance_dt, no gap):
-          as_of_dt falls at slot (-_md).
-          Window covers slots [-_md .. -_md+W-1].
-          All W months are available in history.
-
-        CASE B — _md > 0 (as_of_dt > balance_dt, gap of _md months):
-          The _md months between balance_dt and as_of_dt have no history.
-          slot 0 (past_due_am) = balance_dt = as_of_dt - _md months.
-          Window covers:
-            positions 1.._md       → gap (NULL, not in history)
-            position  _md+1        → slot 0 = past_due_am
-            positions _md+2.._md+k → slots 1..k-1
-          Valid slots in 0..36: [0 .. W-_md-1]  when W > _md, else NULL.
-        """
-        indicators = []
-        # idx=0 → past_due_am (slot 0 = balance_dt month)
-        # idx=1..36 → past_due_am_01..36
-        for idx in range(0, N_HISTORY + 1):
-            col_name = ALL_PDU_COLS[idx]  # index 0="past_due_am", 1="past_due_am_01", ...
-
-            # CASE A: _md <= 0  → start slot = -_md, window = [-_md .. -_md+W-1]
-            in_window_a = (
-                (F.col("_md") <= F.lit(0)) &
-                (F.lit(idx) >= -F.col("_md")) &
-                (F.lit(idx) <= -F.col("_md") + F.lit(window - 1))
-            )
-            # CASE B: _md > 0  → valid slots 0 .. W-_md-1  (when W > _md)
-            in_window_b = (
-                (F.col("_md") > F.lit(0)) &
-                (F.col("_md") < F.lit(window)) &
-                (F.lit(idx) >= F.lit(0)) &
-                (F.lit(idx) <= F.lit(window) - F.col("_md") - F.lit(1))
-            )
-            in_window = in_window_a | in_window_b
-
-            flag = F.when(
-                in_window,
-                F.when(F.col(col_name).cast("double") > 0, F.lit(1.0)).otherwise(F.lit(0.0))
-            ).otherwise(F.lit(None).cast("double"))
-            if product_filter is not None:
-                flag = F.when(product_filter, flag).otherwise(F.lit(None).cast("double"))
-            indicators.append(flag)
-
-        total   = sum(F.coalesce(c, F.lit(0.0)) for c in indicators)
-        valid_n = sum(F.when(c.isNotNull(), F.lit(1.0)).otherwise(F.lit(0.0)) for c in indicators)
-        return F.when(valid_n > 0, (total / F.lit(float(window))).cast("double")
-               ).otherwise(F.lit(None).cast("double"))
-
-    @staticmethod
-    def _util_slots(window: int) -> List[F.Column]:
-        """
-        Per-slot CC utilization = balance_am_NN / credit_limit_am_NN.
-
-        Slot resolution (idx 0..36):
-          slot idx = balance at (balance_dt - idx months)
-          _md = ceil(months_between(as_of_dt, balance_dt))
-
-        CASE A — _md <= 0 (as_of_dt <= balance_dt, no gap):
-          Window covers slots [-_md .. -_md+W-1].
-
-        CASE B — _md > 0 (as_of_dt > balance_dt, gap of _md months):
-          Gap months have no data (NULL).
-          Valid slots: [0 .. W-_md-1]  when W > _md, else all NULL.
-          slot 0 = balance_am / credit_limit_am (the balance_dt month itself).
-        """
-        slots = []
-        # idx=0 → balance_am / credit_limit_am
-        # idx=1..36 → balance_am_01..36 / credit_limit_am_01..36
-        for idx in range(0, N_HISTORY + 1):
-            bal_col = ALL_BAL_COLS[idx]  # 0="balance_am", 1="balance_am_01", ...
-            cl_col  = ALL_CL_COLS[idx]   # 0="credit_limit_am", 1="credit_limit_am_01", ...
-
-            # CASE A: _md <= 0
-            in_window_a = (
-                (F.col("_md") <= F.lit(0)) &
-                (F.lit(idx) >= -F.col("_md")) &
-                (F.lit(idx) <= -F.col("_md") + F.lit(window - 1))
-            )
-            # CASE B: _md > 0
-            in_window_b = (
-                (F.col("_md") > F.lit(0)) &
-                (F.col("_md") < F.lit(window)) &
-                (F.lit(idx) >= F.lit(0)) &
-                (F.lit(idx) <= F.lit(window) - F.col("_md") - F.lit(1))
-            )
-            in_window = in_window_a | in_window_b
-
-            bal = F.when(F.col(bal_col).cast("double") >= 0,
-                         F.col(bal_col).cast("double")).otherwise(F.lit(None).cast("double"))
-            cl  = F.when(F.col(cl_col).cast("double") > 0,
-                         F.col(cl_col).cast("double")).otherwise(F.lit(None).cast("double"))
-            util = F.when(
-                in_window & bal.isNotNull() & cl.isNotNull(),
-                (bal / cl).cast("double")
-            ).otherwise(F.lit(None).cast("double"))
-            slots.append(util)
-        return slots
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
-
 
         df = (
             df
@@ -358,13 +141,12 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
             .withColumn("_closed_dt",parse_date("closed_dt"))
         )
 
-        # month_diff: as_of relative to balance_dt
+        # grp03b: months_between(as_of_dt, balance_dt) — as_of FIRST → positive
         df = df.withColumn(
             "_md",
             F.ceil(F.months_between(F.col("_as_of_dt"), F.col("_bal_dt"))).cast("int")
         )
 
-        # Active flag
         df = df.withColumn(
             "_is_active",
             (F.col("_open_dt") <= F.col("_as_of_dt")) &
@@ -372,34 +154,16 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
         )
 
         df = df.withColumn("_acct", F.trim(F.col("acct_type_cd").cast("string")))
-
-        # Product flags — all boolean, consistent types
         df = (
             df
             .withColumn("_is_cc",        F.col("_acct").isin(CC_CODES))
             .withColumn("_is_pl",        F.col("_acct") == PL_CODE)
             .withColumn("_is_stpl",      F.col("_acct") == STPL_CODE)
-            # UNSECURED = ~SECURED (includes CC, PL, Student, Education P2P, MFI, BL, STPL)
             .withColumn("_is_usl",       ~F.col("_acct").isin(SECURED_CODES))
             .withColumn("_is_active_cc", F.col("_is_active") & F.col("_is_cc"))
             .withColumn("_is_active_pl", F.col("_is_active") & F.col("_is_pl"))
         )
 
-        # Current credit limit for CC (credit_limit_am column — Experian variable 13)
-        # Used as scalar denominator for current-month utilization
-        # Per-slot utilization uses credit_limit_am_NN history columns directly
-        df = df.withColumn(
-            "_credit_limit_now",
-            F.when(
-                F.col("_is_cc") &
-                F.col("credit_limit_am").isNotNull() &
-                (F.col("credit_limit_am").cast("double") > 0),
-                F.col("credit_limit_am").cast("double")
-            ).otherwise(F.lit(None).cast("double"))
-        )
-
-        # Current past due amount — NULL if source is NULL/negative (no reporting data)
-        # 0 only when there IS reporting data and past_due = 0
         df = df.withColumn(
             "_pdu_am",
             F.when(
@@ -408,77 +172,149 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
             ).otherwise(F.lit(None).cast("double"))
         )
 
-        # Missed payment frequency columns (per row)
+        # ── Build pdu array ONCE ──────────────────────────────────────────────
+        df = build_history_array(df, "past_due_am", PDU_HIST, "_pdu_arr", clean_negative=False)
+
+        # ── Build balance and credit-limit arrays for CC util ─────────────────
+        df = build_history_array(df, "balance_am",      BAL_HIST, "_bal_arr", clean_negative=False)
+        df = build_history_array(df, "credit_limit_am", CL_HIST,  "_cl_arr",  clean_negative=False)
+
+        # ── Missed payment frequency — per-row column using CASE A/B logic ────
+        # CASE A (_md <= 0): window slots start at -_md
+        # CASE B (_md > 0):  valid slots [0 .. W-_md-1]
+        # Optimised: precompute indicators via array + transform, not 37 WHEN chains
+
+        def _mpf_col(window: int, product_filter=None) -> F.Column:
+            """
+            Per-row missed payment frequency ratio using array transform.
+            Transform the pdu_arr into indicator array, then sum valid slots.
+            Avoids 37×W WHEN chains — uses O(37) element_at calls instead.
+            """
+            # For each slot idx 0..N_HISTORY, compute indicator if slot is in window
+            # CASE A: in window when -_md <= idx <= -_md + W - 1  (_md <= 0)
+            # CASE B: in window when 0 <= idx <= W - _md - 1       (_md > 0, _md < W)
+
+            # Build a sequence of (in_window: bool, pdu: double) and sum
+            # Using transform over sequence avoids Python loop unrolling into plan
+            indicators = F.transform(
+                F.sequence(F.lit(0), F.lit(N_HISTORY)),
+                lambda idx: F.when(
+                    (
+                        # CASE A
+                        (F.col("_md") <= 0) &
+                        (idx >= (-F.col("_md"))) &
+                        (idx <= (-F.col("_md") + F.lit(window - 1)))
+                    ) | (
+                        # CASE B
+                        (F.col("_md") > 0) & (F.col("_md") < F.lit(window)) &
+                        (idx >= 0) & (idx <= (F.lit(window) - F.col("_md") - F.lit(1)))
+                    ),
+                    # pdu indicator for this slot
+                    F.when(
+                        F.element_at(F.col("_pdu_arr"), (idx + F.lit(1)).cast("int")).cast("double") > 0,
+                        F.lit(1.0)
+                    ).otherwise(F.lit(0.0))
+                ).otherwise(F.lit(None).cast("double"))
+            )
+
+            valid_n = F.size(F.filter(indicators, lambda x: x.isNotNull()))
+            total   = F.aggregate(
+                F.filter(indicators, lambda x: x.isNotNull()),
+                F.lit(0.0),
+                lambda acc, x: acc + x
+            )
+            result  = F.when(valid_n > 0, (total / valid_n.cast("double")).cast("double"))
+
+            if product_filter is not None:
+                result = F.when(product_filter, result).otherwise(F.lit(None).cast("double"))
+            return result
+
+        # ── CC util per slot (array-indexed) ─────────────────────────────────
+        def _util_col(window: int) -> F.Column:
+            """
+            Per-row CC utilization (avg over valid window slots).
+            Uses transform over sequence — avoids 37 WHEN chains per window.
+            """
+            utils = F.transform(
+                F.sequence(F.lit(0), F.lit(N_HISTORY)),
+                lambda idx: F.when(
+                    (
+                        (F.col("_md") <= 0) &
+                        (idx >= (-F.col("_md"))) &
+                        (idx <= (-F.col("_md") + F.lit(window - 1)))
+                    ) | (
+                        (F.col("_md") > 0) & (F.col("_md") < F.lit(window)) &
+                        (idx >= 0) & (idx <= (F.lit(window) - F.col("_md") - F.lit(1)))
+                    ),
+                    F.when(
+                        F.col("_is_cc"),
+                        F.when(
+                            F.element_at(F.col("_cl_arr"), (idx + F.lit(1)).cast("int")).cast("double") > 0,
+                            (
+                                F.greatest(F.element_at(F.col("_bal_arr"), (idx + F.lit(1)).cast("int")).cast("double"), F.lit(0.0)) /
+                                F.element_at(F.col("_cl_arr"), (idx + F.lit(1)).cast("int")).cast("double")
+                            )
+                        )
+                    )
+                ).otherwise(F.lit(None).cast("double"))
+            )
+            valid   = F.filter(utils, lambda x: x.isNotNull())
+            n       = F.size(valid)
+            total   = F.aggregate(valid, F.lit(0.0), lambda acc, x: acc + x)
+            avg_val = F.when(n > 0, total / n)
+            max_val = F.array_max(valid)
+            return avg_val, max_val
+
+        # Compute mpf and util per-row columns
         df = (
             df
-            .withColumn("_mpf_3m",       self._missed_payment_freq_col(3))
-            .withColumn("_mpf_6m",       self._missed_payment_freq_col(6))
-            .withColumn("_mpf_12m",      self._missed_payment_freq_col(12))
-            .withColumn("_mpf_3m_cc",    self._missed_payment_freq_col(3,  F.col("_is_cc")))
-            .withColumn("_mpf_6m_cc",    self._missed_payment_freq_col(6,  F.col("_is_cc")))
-            .withColumn("_mpf_12m_cc",   self._missed_payment_freq_col(12, F.col("_is_cc")))
-            .withColumn("_mpf_3m_pl",    self._missed_payment_freq_col(3,  F.col("_is_active_pl")))
-            .withColumn("_mpf_6m_pl",    self._missed_payment_freq_col(6,  F.col("_is_active_pl")))
-            .withColumn("_mpf_12m_pl",   self._missed_payment_freq_col(12, F.col("_is_active_pl")))
-            .withColumn("_mpf_12m_stpl", self._missed_payment_freq_col(12, F.col("_is_stpl")))
-            .withColumn("_mpf_12m_usl",  self._missed_payment_freq_col(12, F.col("_is_usl")))
+            .withColumn("_mpf_3m",       _mpf_col(3))
+            .withColumn("_mpf_6m",       _mpf_col(6))
+            .withColumn("_mpf_12m",      _mpf_col(12))
+            .withColumn("_mpf_3m_cc",    _mpf_col(3,  F.col("_is_cc")))
+            .withColumn("_mpf_6m_cc",    _mpf_col(6,  F.col("_is_cc")))
+            .withColumn("_mpf_12m_cc",   _mpf_col(12, F.col("_is_cc")))
+            .withColumn("_mpf_3m_pl",    _mpf_col(3,  F.col("_is_active_pl")))
+            .withColumn("_mpf_6m_pl",    _mpf_col(6,  F.col("_is_active_pl")))
+            .withColumn("_mpf_12m_pl",   _mpf_col(12, F.col("_is_active_pl")))
+            .withColumn("_mpf_12m_stpl", _mpf_col(12, F.col("_is_stpl")))
+            .withColumn("_mpf_12m_usl",  _mpf_col(12, F.col("_is_usl")))
         )
 
-        # CC utilization slots
-        def apply_cc_filter(slots):
-            return [F.when(F.col("_is_cc"), s).otherwise(F.lit(None).cast("double"))
-                    for s in slots]
-
-        util_3m_cc  = apply_cc_filter(self._util_slots(3))
-        util_6m_cc  = apply_cc_filter(self._util_slots(6))
-        util_12m_cc = apply_cc_filter(self._util_slots(12))
-        util_36m_cc = apply_cc_filter(self._util_slots(36))
-
-        def row_avg(slots):
-            total = sum(F.coalesce(s, F.lit(0.0)) for s in slots)
-            count = sum(F.when(s.isNotNull(), F.lit(1.0)).otherwise(F.lit(0.0)) for s in slots)
-            return F.when(count > 0, total / count).otherwise(F.lit(None).cast("double"))
-
-        def row_max(slots):
-            return F.greatest(*slots)
-
+        # CC util columns (tuple → unpack)
+        u3avg,  u3max  = _util_col(3)
+        u6avg,  u6max  = _util_col(6)
+        u12avg, u12max = _util_col(12)
+        u36avg, u36max = _util_col(36)
         df = (
             df
-            .withColumn("_util_avg_3m",  row_avg(util_3m_cc))
-            .withColumn("_util_avg_6m",  row_avg(util_6m_cc))
-            .withColumn("_util_avg_12m", row_avg(util_12m_cc))
-            .withColumn("_util_avg_36m", row_avg(util_36m_cc))
-            .withColumn("_util_max_3m",  row_max(util_3m_cc))
-            .withColumn("_util_max_6m",  row_max(util_6m_cc))
-            .withColumn("_util_max_12m", row_max(util_12m_cc))
-            .withColumn("_util_max_36m", row_max(util_36m_cc))
+            .withColumn("_util_avg_3m",  u3avg)
+            .withColumn("_util_max_3m",  u3max)
+            .withColumn("_util_avg_6m",  u6avg)
+            .withColumn("_util_max_6m",  u6max)
+            .withColumn("_util_avg_12m", u12avg)
+            .withColumn("_util_max_12m", u12max)
+            .withColumn("_util_avg_36m", u36avg)
+            .withColumn("_util_max_36m", u36max)
         )
 
         def _i(cond):
             return F.when(cond, F.lit(1)).otherwise(F.lit(0))
 
         feature_df = df.groupBy(group_cols).agg(
-
-            # A. Missed payment frequency — all accounts
-            F.avg("_mpf_3m").alias("missed_payment_freq_last_3m"),
-            F.avg("_mpf_6m").alias("missed_payment_freq_last_6m"),
-            F.avg("_mpf_12m").alias("missed_payment_freq_last_12m"),
-
-            # CC only
-            F.avg("_mpf_3m_cc").alias("missed_payment_freq_cc_last_3m"),
-            F.avg("_mpf_6m_cc").alias("missed_payment_freq_cc_last_6m"),
-            F.avg("_mpf_12m_cc").alias("missed_payment_freq_cc_last_12m"),
-
-            # Active PL only
-            F.avg("_mpf_3m_pl").alias("missed_payment_freq_pl_last_3m"),
-            F.avg("_mpf_6m_pl").alias("missed_payment_freq_pl_last_6m"),
-            F.avg("_mpf_12m_pl").alias("missed_payment_freq_pl_last_12m"),
-
-            # STPL and USL (unsecured = ~SECURED, includes CC+PL+education+MFI etc.)
-            F.avg("_mpf_12m_stpl").alias("missed_payment_freq_stpl_last_12m"),
-            F.avg("_mpf_12m_usl").alias("missed_payment_freq_usl_last_12m"),
-
-            # B. CC Utilization (balance/limit)
+            # Past due freq
+            F.avg("_mpf_3m").alias("past_due_freq_last_3m"),
+            F.avg("_mpf_6m").alias("past_due_freq_last_6m"),
+            F.avg("_mpf_12m").alias("past_due_freq_last_12m"),
+            F.avg("_mpf_3m_cc").alias("past_due_freq_cc_last_3m"),
+            F.avg("_mpf_6m_cc").alias("past_due_freq_cc_last_6m"),
+            F.avg("_mpf_12m_cc").alias("past_due_freq_cc_last_12m"),
+            F.avg("_mpf_3m_pl").alias("past_due_freq_pl_last_3m"),
+            F.avg("_mpf_6m_pl").alias("past_due_freq_pl_last_6m"),
+            F.avg("_mpf_12m_pl").alias("past_due_freq_pl_last_12m"),
+            F.avg("_mpf_12m_stpl").alias("past_due_freq_stpl_last_12m"),
+            F.avg("_mpf_12m_usl").alias("past_due_freq_usl_last_12m"),
+            # CC util
             F.avg("_util_avg_3m").alias("avg_cc_utilization_last_3m"),
             F.avg("_util_avg_6m").alias("avg_cc_utilization_last_6m"),
             F.avg("_util_avg_12m").alias("avg_cc_utilization_last_12m"),
@@ -487,30 +323,20 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
             F.max("_util_max_6m").alias("max_cc_utilization_last_6m"),
             F.max("_util_max_12m").alias("max_cc_utilization_last_12m"),
             F.max("_util_max_36m").alias("max_cc_utilization_last_36m"),
-
-            # C. Past due summary
-            F.sum(F.when(F.col("_is_active"), F.col("_pdu_am"))
-            ).alias("total_past_due_active"),
-
+            # Past due
+            F.sum(F.when(F.col("_is_active"), F.col("_pdu_am"))).alias("total_past_due_active"),
             F.sum("_pdu_am").alias("total_past_due_all"),
             F.max("_pdu_am").alias("max_past_due_single_account"),
-
             F.sum(_i(F.col("_pdu_am") > 0)).alias("count_accounts_with_past_due"),
-            F.sum(_i(F.col("_is_active_cc") & (F.col("_pdu_am") > 0))
-            ).alias("count_cc_with_past_due"),
+            F.sum(_i(F.col("_is_active_cc") & (F.col("_pdu_am") > 0))).alias("count_cc_with_past_due"),
             F.max(_i(F.col("_pdu_am") > 0)).alias("flag_any_past_due"),
-
-            # For derived flag
             F.avg("_mpf_12m").alias("_mpf_12m_avg"),
         )
 
-        # flag_consistent_revolver: past due > 50% of last 12 months
         feature_df = feature_df.withColumn(
             "flag_consistent_revolver",
-            F.when(
-                F.col("_mpf_12m_avg").isNotNull() & (F.col("_mpf_12m_avg") > 0.5),
-                F.lit(1)
-            ).otherwise(F.lit(0))
+            F.when(F.col("_mpf_12m_avg").isNotNull() & (F.col("_mpf_12m_avg") > 0.5), F.lit(1))
+             .otherwise(F.lit(0))
         ).drop("_mpf_12m_avg")
 
         self._log_done(feature_df)

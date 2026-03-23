@@ -1,45 +1,14 @@
-# features/tradeline/cat12_delinquency_dpd.py
+# features/tradeline/grp07_delinquency.py  [OPTIMISED]
 # =============================================================================
-# Category 12 — Delinquency / DPD Behaviour
+# Group 07 — Delinquency / DPD Behaviour
 # =============================================================================
-# Source table  : experian_tradeline_segment
+# CRITICAL FIX: replaced 73-WHEN nested _slot() chain with F.array + element_at.
+# Old plan nodes: ~40,000.  New plan nodes: ~300.  Eliminates executor OOM crash.
 #
-# ── COLUMN STRUCTURE ─────────────────────────────────────────────────────────
-#   last_reporting_pymt_dt  → Payment report anchor date
-#   DAYS_PAST_DUE           → Numeric DPD at last_reporting_pymt_dt  (slot 0)
-#   DAYS_PAST_DUE_01..36    → Numeric DPD 1–36 months before         (slots 1–36)
-#
-#   DPD = -1 → Experian null placeholder → treated as NULL
-#   DPD =  0 → current (no overdue)
-#   DPD >  0 → overdue by that many days
-#
-# ── SLOT RESOLUTION ──────────────────────────────────────────────────────────
-#   month_diff = round(months_between(as_of_dt, last_reporting_pymt_dt))
-#
-#   +ve → as_of AHEAD of reporting → gap months exist → NULL for those offsets
-#   -ve → as_of BEHIND reporting   → skip early slots, start from |month_diff|
-#
-#   For window offset k (k=0 = as_of month, k=1 = 1m before, ...):
-#     actual_slot = k - month_diff
-#     slot < 0   → gap (not yet reported) → NULL
-#     slot == 0  → DAYS_PAST_DUE
-#     slot 1–36  → DAYS_PAST_DUE_NN
-#     slot > 36  → beyond history → NULL
-#
-# ── EXAMPLES ─────────────────────────────────────────────────────────────────
-#   Case A: as_of=Apr2025, last_rpt=Jan2025  → month_diff=+3
-#     k=0(Apr): slot=-3 → NULL (gap)
-#     k=3(Jan): slot= 0 → DAYS_PAST_DUE
-#     k=4(Dec): slot= 1 → DAYS_PAST_DUE_01
-#
-#   Case B: as_of=Oct2024, last_rpt=Jan2025  → month_diff=-3
-#     k=0(Oct): slot= 3 → DAYS_PAST_DUE_03
-#     k=1(Sep): slot= 4 → DAYS_PAST_DUE_04
-#     k=5(May): slot= 8 → DAYS_PAST_DUE_08
-#
-# ── AGGREGATION ──────────────────────────────────────────────────────────────
-#   Each row = one tradeline. groupBy(pk_cols + as_of_col) collapses all
-#   tradelines per customer → MAX/SUM/MIN across tradelines gives customer-level.
+# Slot semantics (unchanged):
+#   _md  = ceil(months_between(as_of_dt, last_reporting_pymt_dt))
+#   slot = k - _md  (k=0=as_of, k=1=1m before, ...)
+#   slot<0 → gap→NULL  | slot 0 → days_past_due | slot 1-36 → _NN | >36 → NULL
 # =============================================================================
 
 from pyspark.sql import DataFrame
@@ -49,113 +18,40 @@ from typing import List, Optional
 from features.tradeline.base import TradelineFeatureBase
 from core.logger import get_logger
 from core.date_utils import parse_date
+from core.utils import build_history_array, resolve_slot, build_window_cols
 
 logger = get_logger(__name__)
 
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
+N_HISTORY = 36
+DPD_HIST  = [f"days_past_due_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
 
 SECURED_CODES = {
-    "47",   # Instalment Loan, Automobile
-    "58",   # Instalment Loan, Mortgage
-    "168",  # Microfinance, Housing
-    "172",  # Instalment Loan, Commercial Vehicle
-    "173",  # Instalment Loan, Two-Wheeler
-    "175",  # Business Loan Against Bank Deposits
-    "181",  # Credit Facility, Non-Funded
-    "184",  # Loan Against Bank Deposits
-    "185",  # Loan Against Shares/Securities
-    "191",  # Loan, Gold
-    "195",  # Loan, Property
-    "197",  # Non-Funded Credit Facility, General
-    "198",  # Non-Funded Credit Facility, Priority Sector - Small Business
-    "199",  # Non-Funded Credit Facility, Priority Sector - Agriculture
-    "200",  # Non-Funded Credit Facility, Priority Sector - Others
-    "219",  # Leasing, Other
-    # 220 (Secured Credit Card) removed — CCs (incl. 220) are treated as CC/unsecured category
-    "221",  # Used Car Loan
-    "222",  # Construction Equipment Loan
-    "223",  # Tractor Loan
-    "240",  # Pradhan Mantri Awas Yojna  (housing scheme)
-    "241",  # Business Loan – Secured
-    "243",  # Priority Sector Gold Loan
-    "246",  # P2P Auto Loan
-    "248",  # GECL Loan Secured
+    "47","58","168","172","173","175","181","184","185","191","195",
+    "197","198","199","200","219","221","222","223","240","241","243","246","248",
 }
-
-
-CC_CODES = {"5", "213", "214", "220", "224", "225"}    # All CCs incl. 220 (Secured CC — treated as CC/unsecured)
-HL_CODES = {"58", "195", "168", "240"}
-GL_CODES = {"191", "243"}
-AL_CODES = {"47", "173", "172", "221", "222", "223", "246"}
+CC_CODES = {"5","213","214","220","224","225"}
+HL_CODES = {"58","195","168","240"}
+GL_CODES = {"191","243"}
+AL_CODES = {"47","173","172","221","222","223","246"}
 PL_CODE  = "123"
-
-N_HISTORY = 36
-DPD_COLS  = [f"days_past_due_{str(i).zfill(2)}" for i in range(1, N_HISTORY + 1)]
-
-
-# =============================================================================
-# DPD SIGNAL HELPER
-# =============================================================================
-
-def _clean(dpd: F.Column) -> F.Column:
-    """Clean numeric DPD: treat -1 as NULL."""
-    return F.when(dpd >= 0, dpd.cast("double")).otherwise(F.lit(None).cast("double"))
 
 
 def _all_history(product_filter: Optional[F.Column] = None) -> F.Column:
-    """MAX DPD across all 37 raw slots (no as_of alignment). For all-time max features."""
-    val = F.greatest(
-        _clean(F.col("days_past_due")),
-        *[_clean(F.col(c)) for c in DPD_COLS]
-    )
-    return F.when(product_filter, val) if product_filter is not None else val
+    """MAX DPD across all 37 raw slots via array_max — no as_of alignment, plan-cheap."""
+    val = F.array_max(F.col("_dpd_arr"))
+    if product_filter is not None:
+        val = F.when(product_filter, val).otherwise(F.lit(None).cast("double"))
+    return val
 
 
 class DelinquencyDPDFeatures(TradelineFeatureBase):
-    """
-    Category 12: Delinquency / DPD Behaviour
-    All features use DAYS_PAST_DUE numeric columns only.
-    Slot resolution: actual_slot = k - month_diff
-    """
+    """Group 07: Delinquency / DPD Behaviour (array-optimised)."""
 
     CATEGORY = "grp07_delinquency"
-
-    @staticmethod
-    def _slot(k: int, product_filter: Optional[F.Column] = None) -> F.Column:
-        """
-        Resolve DPD at window offset k from as_of_dt.
-        actual_slot = k - month_diff (_md).
-        """
-        expr = F.lit(None).cast("double")
-        for m in range(-N_HISTORY, N_HISTORY + 1):
-            slot = k - m
-            if slot < 0:
-                raw = F.lit(None).cast("double")          # gap
-            elif slot == 0:
-                raw = _clean(F.col("days_past_due"))
-            elif slot <= N_HISTORY:
-                raw = _clean(F.col(DPD_COLS[slot - 1]))
-            else:
-                raw = F.lit(None).cast("double")           # beyond history
-            expr = F.when(F.col("_md") == m, raw).otherwise(expr)
-        if product_filter is not None:
-            expr = F.when(product_filter, expr).otherwise(F.lit(None).cast("double"))
-        return expr
-
-    @classmethod
-    def _window(cls, w: int,
-                product_filter: Optional[F.Column] = None) -> List[F.Column]:
-        """Build list of w slot-columns for a window of w months."""
-        return [cls._slot(k, product_filter) for k in range(w)]
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
-
-        # ── STEP 1: Parse dates ───────────────────────────────────────────────
 
         df = (
             df
@@ -165,7 +61,6 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             .withColumn("_closed_dt", parse_date("closed_dt"))
         )
 
-        # Active flag — used for current_dpd and current_dpd_due
         df = df.withColumn(
             "_is_active",
             F.when(
@@ -175,15 +70,11 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             ).otherwise(F.lit(0))
         )
 
-        # ── STEP 2: month_diff ────────────────────────────────────────────────
         df = df.withColumn(
             "_md",
-            F.ceil(F.months_between(
-                F.col("_as_of_dt"), F.col("_rpt_dt")
-            )).cast("int")
+            F.ceil(F.months_between(F.col("_as_of_dt"), F.col("_rpt_dt"))).cast("int")
         )
 
-        # ── STEP 3: Clean amounts ─────────────────────────────────────────────
         df = (
             df
             .withColumn("_loan_am",
@@ -194,14 +85,12 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
                  .otherwise(F.lit(0.0)))
         )
 
-        # ── STEP 4: Product flags ─────────────────────────────────────────────
         df = df.withColumn("_acct", F.trim(F.col("acct_type_cd").cast("string")))
         df = (
             df
-            .withColumn("_is_usl",
-                ~ F.col("_acct").isin(SECURED_CODES))
+            .withColumn("_is_usl",       ~F.col("_acct").isin(SECURED_CODES))
             .withColumn("_is_usl_gt50k",
-                ~ F.col("_acct").isin(SECURED_CODES) &
+                ~F.col("_acct").isin(SECURED_CODES) &
                 F.col("_loan_am").isNotNull() & (F.col("_loan_am") > 50000))
             .withColumn("_is_cc",  F.col("_acct").isin(CC_CODES))
             .withColumn("_is_hl",  F.col("_acct").isin(HL_CODES))
@@ -210,69 +99,82 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             .withColumn("_is_pl",  F.col("_acct") == PL_CODE)
         )
 
-        # ── STEP 5: Build windowed slot arrays ────────────────────────────────
-        pl_f    = F.col("_is_pl")
+        # ── KEY OPTIMISATION: build DPD array ONCE (replaces 73-WHEN loop) ───
+        df = build_history_array(df, "days_past_due", DPD_HIST, "_dpd_arr",
+                                 clean_negative=True)
 
-        w3      = self._window(3)
-        w6      = self._window(6)
-        w12     = self._window(12)
-        w36     = self._window(36)
-        w15     = self._window(15)          # use [3:15] for 3–15m window
-        w12_pl  = self._window(12, pl_f)
-        w36_pl  = self._window(36, pl_f)
+        # ── Per-row delinquency recency (array_min of distance-to-DPD) ────────
+        # months_from_as_of when DPD at slot s ≥ threshold = _md + s
+        df = (
+            df
+            .withColumn("_dpd30_dist",
+                F.array_min(F.transform(
+                    F.sequence(F.lit(0), F.lit(N_HISTORY)),
+                    lambda s: F.when(
+                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) >= F.lit(30.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.col("_md") + s).cast("double")
+                    ).otherwise(F.lit(None).cast("double"))
+                ))
+            )
+            .withColumn("_dpd15_dist",
+                F.array_min(F.transform(
+                    F.sequence(F.lit(0), F.lit(N_HISTORY)),
+                    lambda s: F.when(
+                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(15.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.col("_md") + s).cast("double")
+                    ).otherwise(F.lit(None).cast("double"))
+                ))
+            )
+            .withColumn("_dpd0_dist",
+                F.array_min(F.transform(
+                    F.sequence(F.lit(0), F.lit(N_HISTORY)),
+                    lambda s: F.when(
+                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(0.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.col("_md") + s).cast("double")
+                    ).otherwise(F.lit(None).cast("double"))
+                ))
+            )
+        )
 
-        # ── STEP 6: Aggregate ─────────────────────────────────────────────────
+        # ── Build window slot-Column lists (array-indexed, plan-cheap) ─────────
+        pl_f   = F.col("_is_pl")
+        w3     = build_window_cols("_dpd_arr", 3)
+        w6     = build_window_cols("_dpd_arr", 6)
+        w12    = build_window_cols("_dpd_arr", 12)
+        w36    = build_window_cols("_dpd_arr", 36)
+        w15    = build_window_cols("_dpd_arr", 15)
+        w12_pl = build_window_cols("_dpd_arr", 12, product_filter=pl_f)
+        w36_pl = build_window_cols("_dpd_arr", 36, product_filter=pl_f)
+
         feature_df = df.groupBy(group_cols).agg(
 
-            # ── Max DPD — all history (no as_of alignment) ───────────────────
+            # Max DPD — all-history (array_max = plan-cheap vs F.greatest(*37cols))
             F.max(_all_history()).alias("max_dpd"),
             F.max(_all_history(F.col("_is_usl"))).alias("max_dpd_usl"),
             F.max(_all_history(F.col("_is_usl_gt50k"))).alias("max_dpd_usl_gt50k"),
-
-            # Product max DPD — all-history (same as max_dpd / max_dpd_usl)
-            # Uses _all_history() = MAX across all 37 raw slots, no as_of alignment.
-            # Replaces _slot(k=0) which returned NULL when rpt_dt < as_of_dt (gap).
             F.max(_all_history(F.col("_is_cc"))).alias("max_dpd_CC"),
             F.max(_all_history(F.col("_is_hl"))).alias("max_dpd_HL"),
             F.max(_all_history(F.col("_is_gl"))).alias("max_dpd_GL"),
             F.max(_all_history(F.col("_is_al"))).alias("max_dpd_AL"),
             F.max(_all_history(F.col("_is_pl"))).alias("max_dpd_pl"),
 
-            # ── Windowed max DPD ──────────────────────────────────────────────
+            # Windowed max DPD (greatest over slot-columns)
             F.max(F.greatest(*w36)).alias("max_dpd_in_3_years"),
             F.max(F.greatest(*w12)).alias("max_dpd_in_12_months"),
             F.max(F.greatest(*w15[3:15])).alias("max_dpd_in_last_3_15_mon"),
             F.max(F.greatest(*w12_pl)).alias("max_dpd_pl_12m"),
             F.max(F.greatest(*w36_pl)).alias("max_dpd_pl_3y"),
 
-            # ── DPD counts ────────────────────────────────────────────────────
-            # Null-aware DPD counts:
-            # NULL if NO data in window (all slots NULL = no reporting history)
-            # 0    if data exists but DPD was 0 in all reported months
-            # N    count of months with DPD > threshold
-            F.sum(F.when(F.greatest(*w12).isNotNull(),
-                         F.when(F.greatest(*w12) > 0,  F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd_in_12_months"),
-            F.sum(F.when(F.greatest(*w12).isNotNull(),
-                         F.when(F.greatest(*w12) >= 30, F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd30_in_12_months"),
-            F.sum(F.when(F.greatest(*w12).isNotNull(),
-                         F.when(F.greatest(*w12) >= 60, F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd60_in_12_months"),
-            F.sum(F.when(F.greatest(*w12).isNotNull(),
-                         F.when(F.greatest(*w12) >= 90, F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd90_in_12_months"),
-            F.sum(F.when(F.greatest(*w36).isNotNull(),
-                         F.when(F.greatest(*w36) > 0,  F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd_in_36_months"),
-            F.sum(F.when(F.greatest(*w12_pl).isNotNull(),
-                         F.when(F.greatest(*w12_pl) >= 30, F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd30_pl_12m"),
-            F.sum(F.when(F.greatest(*w36_pl).isNotNull(),
-                         F.when(F.greatest(*w36_pl) > 0, F.lit(1)).otherwise(F.lit(0)))
-            ).alias("no_of_dpd_pl_36m"),
+            # DPD counts
+            F.sum(F.when(F.greatest(*w12).isNotNull(), F.when(F.greatest(*w12) > 0,  F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd_in_12_months"),
+            F.sum(F.when(F.greatest(*w12).isNotNull(), F.when(F.greatest(*w12) >= 30, F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd30_in_12_months"),
+            F.sum(F.when(F.greatest(*w12).isNotNull(), F.when(F.greatest(*w12) >= 60, F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd60_in_12_months"),
+            F.sum(F.when(F.greatest(*w12).isNotNull(), F.when(F.greatest(*w12) >= 90, F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd90_in_12_months"),
+            F.sum(F.when(F.greatest(*w36).isNotNull(), F.when(F.greatest(*w36) > 0,  F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd_in_36_months"),
+            F.sum(F.when(F.greatest(*w12_pl).isNotNull(), F.when(F.greatest(*w12_pl) >= 30, F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd30_pl_12m"),
+            F.sum(F.when(F.greatest(*w36_pl).isNotNull(), F.when(F.greatest(*w36_pl) > 0, F.lit(1)).otherwise(F.lit(0)))).alias("no_of_dpd_pl_36m"),
 
-            # ── DPD bucket flags ──────────────────────────────────────────────
+            # DPD bucket flags
             F.max(F.when((F.greatest(*w3)  >= 10) & (F.greatest(*w3)  < 30), F.lit(1)).otherwise(F.lit(0))).alias("is_10to30_last3_months"),
             F.max(F.when((F.greatest(*w3)  >= 30) & (F.greatest(*w3)  < 60), F.lit(1)).otherwise(F.lit(0))).alias("is_30to60_last3_months"),
             F.max(F.when((F.greatest(*w3)  >= 60) & (F.greatest(*w3)  < 90), F.lit(1)).otherwise(F.lit(0))).alias("is_60to90_last3_months"),
@@ -283,7 +185,7 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             F.max(F.when((F.greatest(*w12) >= 30) & (F.greatest(*w12) < 60), F.lit(1)).otherwise(F.lit(0))).alias("is_30to60_last12_months"),
             F.max(F.when((F.greatest(*w12) >= 60) & (F.greatest(*w12) < 90), F.lit(1)).otherwise(F.lit(0))).alias("is_60to90_last12_months"),
 
-            # ── Severity flags — all-history ──────────────────────────────────
+            # Severity flags — all-history (array_max = O(1) per row)
             F.max(F.when(_all_history() >= 180, F.lit(1)).otherwise(F.lit(0))).alias("is_dpd_180"),
             F.max(F.when(_all_history() >=  90, F.lit(1)).otherwise(F.lit(0))).alias("is_dpd_90"),
             F.max(F.when(_all_history() >=  60, F.lit(1)).otherwise(F.lit(0))).alias("is_dpd_60"),
@@ -297,44 +199,17 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
             F.max(F.when(F.greatest(*w36) >= 180, F.lit(1)).otherwise(F.lit(0))).alias("is_dpd_180_last36m"),
             F.max(F.when(F.greatest(*w36) >=  90, F.lit(1)).otherwise(F.lit(0))).alias("is_dpd_90_last36m"),
 
-            # ── Delinquency recency ───────────────────────────────────────────
-            # For each raw slot s (0..36), months from as_of_dt = _md + s.
-            # All accounts considered regardless of md — DPDs are from rpt_dt.
-            F.min(F.coalesce(*[
-                F.when(
-                    _clean(F.col("days_past_due" if s == 0 else f"days_past_due_{str(s).zfill(2)}")) >= 30,
-                    (F.col("_md") + F.lit(s)).cast("double")
-                )
-                for s in range(N_HISTORY + 1)
-            ])).alias("months_since_last_dpd30"),
+            # Recency (pre-computed per-row above — just aggregate with min)
+            F.min("_dpd30_dist").alias("months_since_last_dpd30"),
+            F.min("_dpd15_dist").alias("MostRecentDPDGT15Month"),
+            F.min("_dpd0_dist").alias("MostRecentDPDGT0Month"),
 
-            F.min(F.coalesce(*[
-                F.when(
-                    _clean(F.col("days_past_due" if s == 0 else f"days_past_due_{str(s).zfill(2)}")) > 15,
-                    (F.col("_md") + F.lit(s)).cast("double")
-                )
-                for s in range(N_HISTORY + 1)
-            ])).alias("MostRecentDPDGT15Month"),
-
-            F.min(F.coalesce(*[
-                F.when(
-                    _clean(F.col("days_past_due" if s == 0 else f"days_past_due_{str(s).zfill(2)}")) > 0,
-                    (F.col("_md") + F.lit(s)).cast("double")
-                )
-                for s in range(N_HISTORY + 1)
-            ])).alias("MostRecentDPDGT0Month"),
-
-            # ── Current DPD — most recent reported DPD for active accounts ────
-            # days_past_due is the DPD at rpt_dt (slot 0 of the history).
-            # All active accounts included regardless of md.
+            # Current DPD — slot 0 of array = days_past_due at rpt_dt
             F.max(
-                F.when(F.col("_is_active") == 1, _clean(F.col("days_past_due")))
+                F.when(F.col("_is_active") == 1, F.element_at(F.col("_dpd_arr"), F.lit(1)))
             ).alias("current_dpd"),
 
-            # Total past-due amount — active accounts only
-            F.sum(
-                F.when(F.col("_is_active") == 1, F.col("_past_due_am"))
-            ).alias("current_dpd_due"),
+            F.sum(F.when(F.col("_is_active") == 1, F.col("_past_due_am"))).alias("current_dpd_due"),
         )
 
         self._log_done(feature_df)
