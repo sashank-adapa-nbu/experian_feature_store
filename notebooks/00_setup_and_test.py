@@ -6,16 +6,22 @@
 # =============================================================================
 
 # COMMAND ----------
+
+# Enable autoreload for import scripts so changes are reflected automatically
+%load_ext autoreload
+%autoreload 2
+
+# COMMAND ----------
+
 import sys
-REPO_ROOT = "/Workspace/Repos/<your-username>/experian_feature_store"  # ← update
+REPO_ROOT = "/Workspace/Users/sashanknagasai.adapa@angelone.in/experian_feature_store" 
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 print(f"REPO_ROOT: {REPO_ROOT}")
 
 # COMMAND ----------
-# ── 1. Config ─────────────────────────────────────────────────────────────────
-print("Testing config...")
+
 from config import config
 print(f"  TRADELINE_TABLE : {config.TRADELINE_TABLE}")
 print(f"  ENQUIRY_TABLE   : {config.ENQUIRY_TABLE}")
@@ -25,6 +31,7 @@ print(f"  RETRO_PK_COLS   : {config.RETRO_PK_COLS}")
 print("  ✅ config OK")
 
 # COMMAND ----------
+
 # ── 2. Core utilities ─────────────────────────────────────────────────────────
 print("Testing core...")
 from core.logger import get_logger
@@ -33,6 +40,7 @@ logger.info("Logger works")
 print("  ✅ core OK")
 
 # COMMAND ----------
+
 # ── 3. Feature base classes ───────────────────────────────────────────────────
 print("Testing base classes...")
 from features.tradeline.base import TradelineFeatureBase
@@ -42,8 +50,6 @@ print(f"  EnquiryFeatureBase   : {EnquiryFeatureBase}")
 print("  ✅ base classes OK")
 
 # COMMAND ----------
-# ── 4. Feature groups ─────────────────────────────────────────────────────────
-print("Testing feature group imports...")
 
 from features.tradeline.grp01_portfolio_counts      import PortfolioCountsFeatures
 from features.tradeline.grp02_loan_amounts          import (LoanAmountExposureFeatures,
@@ -66,7 +72,7 @@ from features.enquiry.grp12_enquiries               import CreditEnquiriesFeatur
 print("  ✅ all 11 group imports OK")
 
 # COMMAND ----------
-# ── 5. Registry ───────────────────────────────────────────────────────────────
+
 print("Testing registry...")
 from features.registry import TRADELINE_FEATURE_CLASSES, ENQUIRY_FEATURE_CLASSES
 
@@ -81,6 +87,7 @@ for cls in ENQUIRY_FEATURE_CLASSES:
 print("  ✅ registry OK")
 
 # COMMAND ----------
+
 # ── 6. Pipeline classes ───────────────────────────────────────────────────────
 print("Testing pipeline imports...")
 from pipeline.scrub_pipeline import ScrubPipeline
@@ -90,6 +97,7 @@ print(f"  RetroPipeline : {RetroPipeline}")
 print("  ✅ pipeline OK")
 
 # COMMAND ----------
+
 # ── 7. Source table access ────────────────────────────────────────────────────
 print("Testing source table access...")
 try:
@@ -104,9 +112,5 @@ except Exception as e:
     print(f"  ❌ Table access failed: {e}")
 
 # COMMAND ----------
-print("\n" + "="*50)
-print("  ALL CHECKS PASSED — repo is ready ✅")
-print("  Next: run test_single_customer.py to validate")
-print("        features for one customer before scheduling")
-print("        the full pipeline job.")
-print("="*50)
+
+

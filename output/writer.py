@@ -14,7 +14,7 @@ from delta.tables import DeltaTable
 
 from core.logger import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger(__name__) 
 
 
 class FeatureWriter:
@@ -56,13 +56,38 @@ class FeatureWriter:
         else:
             raise ValueError(f"Unsupported write_mode: {write_mode}")
 
+    @staticmethod
+    def _dedup_columns(df: DataFrame) -> DataFrame:
+        """
+        Remove duplicate column names from a DataFrame.
+        Spark raises AMBIGUOUS_COLUMN_OR_FIELD if a column name appears more
+        than once — this can happen when multiple feature groups share join keys
+        that survive through the join chain. Keep the first occurrence only.
+        """
+        seen: set = set()
+        cols = []
+        for c in df.columns:
+            if c not in seen:
+                cols.append(c)
+                seen.add(c)
+        return df.select(cols) if len(cols) < len(df.columns) else df
+
     def _append(self, df: DataFrame, table_name: str, partition_col: Optional[str]):
         """
         Append with dynamic partition overwrite — idempotent per partition.
         Re-running for the same scrub_output_date overwrites that partition only,
         making the pipeline safe to retry on failure.
         """
+        df = self._dedup_columns(df)
+        # ── PARTITION TYPE FIX ────────────────────────────────────────────────
+        # After 16 groupBy→join passes the partition column (scrub_output_date)
+        # can end up as StringType. Delta's partition writer then tries to parse
+        # the string as a timestamp and throws CANNOT_PARSE_TIMESTAMP.
+        # Explicitly cast to DateType before writing so Delta sees the correct
+        # type and writes clean date partition paths (2023-12-05/ not a ts).
         if partition_col and partition_col in df.columns:
+            from pyspark.sql import functions as F
+            df = df.withColumn(partition_col, F.col(partition_col).cast("date"))
             writer = (
                 df.write
                 .format("delta")
@@ -82,6 +107,10 @@ class FeatureWriter:
             raise
 
     def _overwrite(self, df: DataFrame, table_name: str, partition_col: Optional[str]):
+        df = self._dedup_columns(df)
+        if partition_col and partition_col in df.columns:
+            from pyspark.sql import functions as F
+            df = df.withColumn(partition_col, F.col(partition_col).cast("date"))
         writer = df.write.format("delta").mode("overwrite")
         if partition_col and partition_col in df.columns:
             writer = writer.partitionBy(partition_col)

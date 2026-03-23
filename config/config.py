@@ -36,19 +36,34 @@ PARTITION_COL    = "scrub_output_date"
 # ── Max History Columns ───────────────────────────────────────────────────────
 MAX_HISTORY_COLS = 36
 
-
-SHUFFLE_PARTITIONS     = 300       # spark.sql.shuffle.partitions
-ADAPTIVE_ENABLED       = True       # AQE — auto-coalesces small partitions post-shuffle
-SKEW_JOIN_ENABLED      = True       # AQE skew join handling
-BROADCAST_THRESHOLD_MB = 50         # tables <= 50MB auto-broadcast (avoid shuffle joins)
-CODEGEN_MAX_FIELDS     = 200        # default 100 — increase for wide schemas
-ARROW_ENABLED          = True       # faster Python↔JVM columnar transfer
-SPECULATION_ENABLED    = False      # disable — straggler re-launch wastes 500M-row resources
+# ── Spark Tuning — cluster: 2-10 workers × 4 cores (autoscaling) ────────────
+# Max cores = 40  |  Target ~128 MB per shuffle partition
+# 500M rows × ~300 bytes/row ≈ 150 GB per scrub date
+# 150 GB / 128 MB ≈ 1200 partitions — use 1200 as floor, AQE coalesces upward.
+#
+# With autoscaling, AQE (ADAPTIVE_ENABLED=True) is critical — it re-optimises
+# the plan as the cluster grows/shrinks mid-job.
+#
+# DISK_ONLY persist in base_pipeline means executors handle caching independently;
+# driver does not track heap blocks so stays responsive even at 500M rows.
+SHUFFLE_PARTITIONS     = 500       # 150GB / 128MB ≈ 1200 — AQE will coalesce smaller ones
+ADAPTIVE_ENABLED       = True       # AQE on — essential for autoscaling clusters
+SKEW_JOIN_ENABLED      = True       # AQE skew join — handles PL-heavy customers
+BROADCAST_THRESHOLD_MB = 50         # master table ~5MB → auto-broadcast
+CODEGEN_MAX_FIELDS     = 200        # grp07/08 produce 250+ col aggs — keep above 200
+ARROW_ENABLED          = True       # faster Python<->JVM transfer for notebooks
+SPECULATION_ENABLED    = False      # off — slow tasks on 500M rows are legitimate
 
 # ── Per-scrub memory / GC settings ───────────────────────────────────────────
-# Passed as Spark SQL conf at runtime.  Override in cluster config for production.
-EXECUTOR_MEMORY_OVERHEAD_FRACTION = 0.15   # extra JVM overhead beyond executor.memory
-MEMORY_FRACTION                   = 0.70   # fraction of heap for execution+storage
+# Set in cluster Advanced Options → Spark Config (static, cannot be set at runtime):
+#   spark.executor.memory              8g    (adjust to instance type)
+#   spark.executor.memoryOverhead      2g    (>= 20% of executor.memory)
+#   spark.memory.fraction              0.7
+#   spark.memory.storageFraction       0.3   (lower storage — DISK_ONLY needs less)
+#   spark.driver.memory                4g
+#   spark.driver.maxResultSize         2g
+EXECUTOR_MEMORY_OVERHEAD_FRACTION = 0.20   # raise to 20% for wide-schema joins
+MEMORY_FRACTION                   = 0.70   # 70% heap for execution+storage
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"

@@ -22,10 +22,6 @@
 #   This keeps peak memory at ~100GB (one scrub), not 10TB (all scrubs).
 #   Each scrub partition is written atomically — failure at any date
 #   leaves all previously processed dates intact and can resume from that date.
-#
-# Schedule example (Databricks Jobs UI):
-#   Trigger  : Every Sunday 02:00 AM
-#   Parameter: scrub_output_date = ALL
 # =============================================================================
 
 # COMMAND ----------
@@ -92,3 +88,7 @@ for tbl, label in [(tl_tbl, "Tradeline"), (enq_tbl, "Enquiry")]:
         df.groupBy("scrub_output_date").count().orderBy("scrub_output_date").show(100, False)
     except Exception as e:
         print(f"  Could not read {tbl}: {e}")
+
+# COMMAND ----------
+
+

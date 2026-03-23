@@ -5,11 +5,10 @@
 # =============================================================================
 # Purpose:
 #   Validate all feature groups for ONE customer_scrub_key before running the
-#   full pipeline as a job. Each group runs in its own cell so you can pinpoint
-#   exactly which group/feature breaks.
-#
+#   full pipeline as a job.
+
 # customer_scrub_key is unique per customer per scrub — no date needed.
-#
+
 # How to use:
 #   1. Set customer_scrub_key widget
 #   2. Run all cells top to bottom (or one cell at a time to debug)
@@ -20,8 +19,15 @@
 # =============================================================================
 
 # COMMAND ----------
+
+# Enable autoreload so that changes in imported modules are automatically reloaded
+%load_ext autoreload
+%autoreload 2
+
+# COMMAND ----------
+
 import sys
-REPO_ROOT = "/Workspace/Repos/<your-username>/experian_feature_store"  # ← update
+REPO_ROOT = "/Workspace/Users/sashanknagasai.adapa@angelone.in/experian_feature_store"  
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -29,13 +35,15 @@ import pyspark.sql.functions as F
 from pyspark.sql import DataFrame
 
 # COMMAND ----------
+
 # ── Widget ────────────────────────────────────────────────────────────────────
-dbutils.widgets.text("customer_scrub_key", "", "customer_scrub_key to test (required)")
-TEST_KEY = dbutils.widgets.get("customer_scrub_key").strip()
+customer_scrub_key = '1000019_ANG250500163315201'
+TEST_KEY = customer_scrub_key.strip()
 assert TEST_KEY, "Set customer_scrub_key widget before running"
 print(f"Testing: customer_scrub_key = '{TEST_KEY}'")
 
 # COMMAND ----------
+
 # ── Load raw tradeline rows ───────────────────────────────────────────────────
 # customer_scrub_key is unique per customer per scrub — filter directly, no date needed
 from config import config
@@ -70,15 +78,7 @@ PK_COLS   = ["customer_scrub_key", "party_code", "scrub_output_date"]
 AS_OF_COL = "scrub_output_date"
 
 # COMMAND ----------
-# ── Show raw tradeline rows ───────────────────────────────────────────────────
-print(f"=== RAW TRADELINE ROWS for {TEST_KEY} ===")
-tl_df.select(
-    "acct_type_cd", "open_dt", "closed_dt",
-    "orig_loan_am", "balance_am", "days_past_due",
-    "m_sub_id", "suit_filed_willful_dflt", "written_off_and_settled_status"
-).show(50, truncate=False)
 
-# COMMAND ----------
 # ── Helper: display features transposed ──────────────────────────────────────
 def show_features(df: DataFrame, group_name: str):
     rows = df.collect()
@@ -110,70 +110,87 @@ def run_group(cls, label: str):
         return None
 
 # COMMAND ----------
+
 from features.tradeline.grp01_portfolio_counts import PortfolioCountsFeatures
 r01 = run_group(PortfolioCountsFeatures, "grp01_portfolio_counts")
 
 # COMMAND ----------
+
 from features.tradeline.grp02_loan_amounts import LoanAmountExposureFeatures
 r02a = run_group(LoanAmountExposureFeatures, "grp02a_loan_amount_exposure")
 
 # COMMAND ----------
+
 from features.tradeline.grp02_loan_amounts import CreditCardLimitsFeatures
 r02b = run_group(CreditCardLimitsFeatures, "grp02b_credit_card_limits")
 
 # COMMAND ----------
+
 from features.tradeline.grp02_loan_amounts import HighestCreditSignalsFeatures
 r02c = run_group(HighestCreditSignalsFeatures, "grp02c_highest_credit_signals")
 
 # COMMAND ----------
+
 from features.tradeline.grp02_loan_amounts import LoanVolumeOverTimeFeatures
 r02d = run_group(LoanVolumeOverTimeFeatures, "grp02d_loan_volume_over_time")
 
 # COMMAND ----------
+
 from features.tradeline.grp03_balances_utilization import OutstandingBalanceFeatures
 r03a = run_group(OutstandingBalanceFeatures, "grp03a_outstanding_balance")
 
 # COMMAND ----------
+
 from features.tradeline.grp03_balances_utilization import CreditUtilizationFeatures
 r03b = run_group(CreditUtilizationFeatures, "grp03b_credit_utilization")
 
 # COMMAND ----------
+
 from features.tradeline.grp04_bureau_vintage import BureauVintageFeatures
 r04 = run_group(BureauVintageFeatures, "grp04_bureau_vintage")
 
 # COMMAND ----------
+
 from features.tradeline.grp05_lender_mix import LenderTypeMixFeatures
 r05 = run_group(LenderTypeMixFeatures, "grp05_lender_mix")
 
 # COMMAND ----------
+
 from features.tradeline.grp06_recency_flags import RecencyCreditActivityFeatures
 r06a = run_group(RecencyCreditActivityFeatures, "grp06a_recency_credit_activity")
 
 # COMMAND ----------
+
 from features.tradeline.grp06_recency_flags import CreditBehaviourFlagsFeatures
 r06b = run_group(CreditBehaviourFlagsFeatures, "grp06b_credit_behaviour_flags")
 
 # COMMAND ----------
+
 from features.tradeline.grp07_delinquency import DelinquencyDPDFeatures
 r07 = run_group(DelinquencyDPDFeatures, "grp07_delinquency_dpd")
 
 # COMMAND ----------
+
 from features.tradeline.grp08_payment_repayment import PaymentBehaviourFeatures
 r08a = run_group(PaymentBehaviourFeatures, "grp08a_payment_behaviour")
 
 # COMMAND ----------
+
 from features.tradeline.grp08_payment_repayment import RepaymentRatioFeatures
 r08b = run_group(RepaymentRatioFeatures, "grp08b_repayment_ratio")
 
 # COMMAND ----------
+
 from features.tradeline.grp09_obligations import ObligationsFeatures
 r09 = run_group(ObligationsFeatures, "grp09_obligations")
 
 # COMMAND ----------
+
 from features.tradeline.grp10_severe_risk import WriteoffsSevereRiskFeatures
 r10 = run_group(WriteoffsSevereRiskFeatures, "grp10_severe_risk")
 
 # COMMAND ----------
+
 # ── Enquiries ─────────────────────────────────────────────────────────────────
 # Enquiry table is filtered by customer_scrub_key + inq_date <= scrub_output_date
 from features.enquiry.grp12_enquiries import CreditEnquiriesFeatures
@@ -208,6 +225,7 @@ except Exception as e:
     traceback.print_exc()
 
 # COMMAND ----------
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 results = {
     "grp01_portfolio_counts":        r01,
@@ -251,6 +269,7 @@ else:
     print("  All groups passed ✅ — safe to run the pipeline job")
 
 # COMMAND ----------
+
 # ── Optional: wide join of all passing groups ─────────────────────────────────
 # Uncomment to join everything into one wide row for cross-checking
 #
@@ -261,3 +280,7 @@ else:
 #     wide = reduce(lambda a, b: a.join(b, on=join_cols, how="left"), passing)
 #     print(f"Wide row: {len(wide.columns)} features")
 #     display(wide.limit(1))
+
+# COMMAND ----------
+
+

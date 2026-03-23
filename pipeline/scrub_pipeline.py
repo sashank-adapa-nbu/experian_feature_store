@@ -47,6 +47,9 @@ class ScrubPipeline(BasePipeline):
     def _load_master(self) -> DataFrame:
         """
         Load master table deduplicated to one party_code per customer_scrub_key.
+        Selects ONLY customer_scrub_key and party_code so no other columns
+        (including scrub_output_date) leak into the tradeline/enquiry DataFrames
+        via the join and cause AMBIGUOUS_COLUMN errors.
         Cached and broadcast — master is small (< cluster broadcast threshold).
         """
         master = (
@@ -65,7 +68,15 @@ class ScrubPipeline(BasePipeline):
         return F.broadcast(master)
 
     def _add_party_code(self, df: DataFrame, master: DataFrame) -> DataFrame:
-        """Join pre-loaded (broadcast) master to add party_code."""
+        """
+        Join pre-loaded (broadcast) master to add party_code.
+        master contains ONLY customer_scrub_key + party_code so no columns
+        from master can duplicate columns already present in df.
+        """
+        # Drop party_code from df first in case it already exists
+        # (prevents duplicate column if tradeline table carries party_code)
+        if "party_code" in df.columns:
+            df = df.drop("party_code")
         return df.join(master, on="customer_scrub_key", how="left")
 
     def _load_tradeline(self, scrub_date: str, master: DataFrame) -> DataFrame:
@@ -84,6 +95,10 @@ class ScrubPipeline(BasePipeline):
         """
         Load enquiry for customers in this scrub_date.
         Filters inq_date <= scrub_output_date (no leakage).
+
+        NOTE: keys carries scrub_output_date; the enquiry table may also have it.
+        Rename it in keys to avoid AMBIGUOUS_COLUMN after the join,
+        then add it back as a literal so feature groupBy works cleanly.
         """
         logger.info(f"[ScrubPipeline] Loading enquiry | date={scrub_date}")
         keys = (
@@ -91,11 +106,24 @@ class ScrubPipeline(BasePipeline):
             .filter(F.col("scrub_output_date") == scrub_date)
             .select("customer_scrub_key", "scrub_output_date")
             .distinct()
+            # Rename to avoid ambiguity when joining against the enquiry table
+            # which may also carry a scrub_output_date column
+            .withColumnRenamed("scrub_output_date", "_scrub_dt_key")
         )
         enq = (
             self.spark.table(config.ENQUIRY_TABLE)
             .join(F.broadcast(keys), on="customer_scrub_key", how="inner")
-            .filter(F.to_date(F.col("inq_date")) <= F.to_date(F.col("scrub_output_date")))
+            # inq_date is StringType in yyyy-MM-dd format — F.to_date with
+            # no format works fine (same as SQL: to_date(inq_date)).
+            # _scrub_dt_key is DateType (from tradeline scrub_output_date) —
+            # cast directly to date, never through F.to_date which throws
+            # CANNOT_PARSE_TIMESTAMP on non-string columns in LEGACY mode.
+            .filter(
+                F.to_date(F.col("inq_date")) <= F.col("_scrub_dt_key").cast("date")
+            )
+            .drop("_scrub_dt_key")
+            # Restore scrub_output_date as DateType to match partition column type.
+            .withColumn("scrub_output_date", F.lit(scrub_date).cast("date"))
         )
         return self._add_party_code(enq, master)
 
@@ -136,20 +164,51 @@ class ScrubPipeline(BasePipeline):
         # Load master once per scrub date (broadcast — stays in executor memory)
         master = self._load_master()
 
-        # ── Tradeline features ────────────────────────────────────────────────
-        tl_df = self._load_tradeline(scrub_date, master)
-        # DO NOT call .count() here — it triggers a full scan of 500M rows just for logging
-        feats = self.run_tradeline_categories(tl_df, scrub_date)
-        if feats is not None:
-            self.write_features(feats, "tradeline", scrub_date)
-        else:
-            logger.warning(f"  No tradeline features for {scrub_date}")
+        try:
+            # ── Tradeline features ────────────────────────────────────────────
+            tl_df = self._load_tradeline(scrub_date, master)
+            # DO NOT call .count() here — triggers full scan of 500M rows
+            feats = self.run_tradeline_categories(tl_df, scrub_date)
+            if feats is not None:
+                self.write_features(feats, "tradeline", scrub_date)
+                # write_features() calls df.unpersist() in its finally block
+            else:
+                logger.warning(f"  No tradeline features for {scrub_date}")
 
-        # ── Enquiry features ──────────────────────────────────────────────────
-        enq_df = self._load_enquiry(scrub_date, master)
-        feats  = self.run_enquiry_categories(enq_df, scrub_date)
-        if feats is not None:
-            self.write_features(feats, "enquiry", scrub_date)
+            # ── Enquiry features ──────────────────────────────────────────────
+            enq_df = self._load_enquiry(scrub_date, master)
+            feats  = self.run_enquiry_categories(enq_df, scrub_date)
+            if feats is not None:
+                self.write_features(feats, "enquiry", scrub_date)
+
+        finally:
+            # ── LEAK FIX: unpersist broadcast master after each date ──────────
+            # _load_master() returns F.broadcast(master). The broadcast hint
+            # pins a copy of the master table in every executor's block manager.
+            # Without unpersist it accumulates across all 108 dates.
+            # unpersist(blocking=True) waits for all executors to confirm
+            # removal before proceeding — safe to call synchronously here
+            # because we are between dates (no active Spark jobs).
+            try:
+                master.unpersist(blocking=True)
+                logger.debug(f"  [GC] Unpersisted broadcast master | date={scrub_date}")
+            except Exception:
+                pass  # best-effort — non-fatal if master was never materialised
+
+            # ── LEAK FIX: explicit JVM GC call on the driver ─────────────────
+            # Python's GC does not reach into the JVM heap where Spark stores
+            # RDD metadata, block manager references, and shuffle map output
+            # tracking tables. Calling System.gc() on the driver JVM prompts
+            # the JVM to reclaim objects that are no longer reachable but not
+            # yet collected — primarily shuffle metadata from completed stages
+            # and orphaned RDD descriptor objects from unpersisted DataFrames.
+            # This is especially effective after unpersist() since JVM GC is
+            # what actually frees the underlying metadata.
+            try:
+                self.spark.sparkContext._jvm.System.gc()
+                logger.debug(f"  [GC] JVM System.gc() called on driver | date={scrub_date}")
+            except Exception:
+                pass  # best-effort — non-fatal
 
         logger.info(f"[ScrubPipeline] DONE | date={scrub_date}")
 
@@ -180,7 +239,11 @@ class ScrubPipeline(BasePipeline):
             logger.info(f"[ScrubPipeline] Processing {i+1}/{len(pending)} | date={d}")
             try:
                 self.run(d)
-                # Explicitly clear executor caches between dates
+                # ── Between-date cleanup ──────────────────────────────────────
+                # clearCache() clears SQL-cached tables (CACHE TABLE / spark.table
+                # calls). Combined with the unpersist + JVM GC inside run(), this
+                # ensures the driver and executor heaps are fully clean before
+                # loading the next scrub date.
                 self.spark.catalog.clearCache()
             except Exception as e:
                 logger.error(f"[ScrubPipeline] FAILED | date={d} | error={e}")
@@ -205,7 +268,7 @@ class ScrubPipeline(BasePipeline):
             logger.info(f"\n[ScrubPipeline] {i+1}/{len(pending)} | date={d}")
             try:
                 self.run(d)
-                self.spark.catalog.clearCache()
+                self.spark.catalog.clearCache()  # SQL cache; RDD GC done inside run()
             except Exception as e:
                 logger.error(f"[ScrubPipeline] FAILED | date={d} | error={e}")
                 raise

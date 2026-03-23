@@ -2,7 +2,6 @@
 # =============================================================================
 # Group 01 — Portfolio Counts & Active Portfolio & Bureau Segments
 # =============================================================================
-# OPTIMISATION: removed undefined _is_spl reference (BUG FIX from session),
 # consolidated all date parsing in one chained call, removed extra sub-agg joins.
 # =============================================================================
 

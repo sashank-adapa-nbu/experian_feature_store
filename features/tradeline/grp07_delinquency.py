@@ -105,13 +105,19 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
 
         # ── Per-row delinquency recency (array_min of distance-to-DPD) ────────
         # months_from_as_of when DPD at slot s ≥ threshold = _md + s
+        # Guard: (_md + s) >= 0 ensures we only record events at or before as_of_dt.
+        # When rpt_dt > as_of_dt (_md < 0), slots s=0..|_md|-1 are future → skip.
+        # NOTE: each condition must be wrapped in its own parens so & sees two
+        # booleans — without parens Python binds & to the float literal first,
+        # producing "DOUBLE & BOOLEAN" which Spark rejects with DATATYPE_MISMATCH.
         df = (
             df
             .withColumn("_dpd30_dist",
                 F.array_min(F.transform(
                     F.sequence(F.lit(0), F.lit(N_HISTORY)),
                     lambda s: F.when(
-                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) >= F.lit(30.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) >= F.lit(30.0)) &
+                        ((F.col("_md") + s) >= F.lit(0)),
                         (F.col("_md") + s).cast("double")
                     ).otherwise(F.lit(None).cast("double"))
                 ))
@@ -120,7 +126,8 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
                 F.array_min(F.transform(
                     F.sequence(F.lit(0), F.lit(N_HISTORY)),
                     lambda s: F.when(
-                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(15.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(15.0)) &
+                        ((F.col("_md") + s) >= F.lit(0)),
                         (F.col("_md") + s).cast("double")
                     ).otherwise(F.lit(None).cast("double"))
                 ))
@@ -129,7 +136,8 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
                 F.array_min(F.transform(
                     F.sequence(F.lit(0), F.lit(N_HISTORY)),
                     lambda s: F.when(
-                        F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(0.0) & ((F.col("_md") + s) >= F.lit(0)),
+                        (F.element_at(F.col("_dpd_arr"), (s + F.lit(1)).cast("int")) > F.lit(0.0)) &
+                        ((F.col("_md") + s) >= F.lit(0)),
                         (F.col("_md") + s).cast("double")
                     ).otherwise(F.lit(None).cast("double"))
                 ))

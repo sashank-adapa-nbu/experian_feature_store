@@ -76,10 +76,21 @@ class ObligationsFeatures(TradelineFeatureBase):
              .when(F.col("_acct").isin({"177","199"}),                        F.lit(0.13/12)   * F.col("_bal_am"))
              .otherwise(                                                       F.lit(0.01)      * F.col("_orig_am"))
         )
+        # ── EMI sanity check ─────────────────────────────────────────────────
+        # Accept raw emi only when it is present, positive, AND plausible:
+        #   emi <= 50% of orig_loan_am
+        # Cases where emi > 50% of orig_loan_am indicate a data quality issue
+        # (e.g. balance mis-stored in the emi field). Fall back to imputed_emi
+        # for those rows so that obligations are not distorted by bad data.
+        # When orig_loan_am is null we cannot validate, so accept raw emi as-is.
         df = df.withColumn(
             "_final_emi",
             F.when(
-                F.col("emi").isNotNull() & (F.col("emi").cast("double") > 0),
+                F.col("emi").isNotNull() & (F.col("emi").cast("double") > 0) &
+                (
+                    F.col("_orig_am").isNull() |
+                    (F.col("emi").cast("double") <= F.lit(0.9) * F.col("_orig_am"))
+                ),
                 F.col("emi").cast("double")
             ).otherwise(imputed_emi)
         )

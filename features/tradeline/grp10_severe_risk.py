@@ -85,9 +85,10 @@ SETTLED_SUIT_CODES  = {"208", "209"}
 RESTRUCTURED_SUIT   = {"200"}
 
 # Appendix F — WRITTEN_OFF_AND_SETTLED_STATUS
-WO_STATUS_CODES       = {"02", "05", "06", "08", "13"}
-# 02=Written-off, 05=Account Sold, 06=Written Off and Account Sold,
-# 08=Account Purchased and Written Off, 13=Post Write Off Closed
+
+WO_STATUS_CODES      = {"02", "05", "06", "08", "13"}            # written off
+SETTLED_STATUS_CODES = {"03", "04", "09", "15", "16"}                        # settled
+RESTRUCTURED_STATUS  = {"00", "01", "10", "11", "12", "14"}            # restructured
 
 SETTLED_STATUS_CODES  = {"03", "04", "09", "15", "16"}
 # 03=Settled, 04=Post(WO)Settled, 09=Account Purchased and Settled,
@@ -104,6 +105,15 @@ USL_CODES = {
     "123", "189", "187", "130", "242", "244", "245", "247",
     "167", "169", "170", "176", "177", "178", "179",
     "228", "227", "226", "249",
+}
+
+UNSECURED_EXCLUDE = {
+    # All secured codes — excluded when counting unsecured tradelines
+    # Must match SECURED_CODES exactly (Appendix A verified)
+    # NOTE: 220 (Secured CC) removed — CCs are treated as unsecured/CC category
+    "47", "58", "168", "172", "173", "175", "181", "184", "185",
+    "191", "195", "197", "198", "199", "200", "219", "221",
+    "222", "223", "240", "241", "243", "246", "248",
 }
 
 
@@ -173,7 +183,6 @@ class WriteoffsSevereRiskFeatures(TradelineFeatureBase):
         self._log_start(mode="dynamic", date="batch")
         group_cols = pk_cols + [as_of_col]
 
-        # ── STEP 1: Parse dates — try_to_date tolerates bad formats → NULL ────
         df = (
             df
             .withColumn("_as_of_dt",  parse_date(as_of_col))
@@ -223,7 +232,7 @@ class WriteoffsSevereRiskFeatures(TradelineFeatureBase):
             df
             .withColumn("_is_pl",   F.col("_acct") == PL_CODE)
             .withColumn("_is_stpl", F.col("_acct") == STPL_CODE)
-            .withColumn("_is_usl",  F.col("_acct").isin(USL_CODES))
+            .withColumn("_is_usl", ~F.col("_acct").isin(UNSECURED_EXCLUDE))
         )
 
         # ── STEP 6: Write-off and settled amounts ────────────────────────────
