@@ -185,7 +185,7 @@ class WriteoffsSevereRiskFeatures(TradelineFeatureBase):
 
         df = (
             df
-            .withColumn("_as_of_dt",  parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
             .withColumn("_open_dt",   parse_date("open_dt"))
             .withColumn("_closed_dt", parse_date("closed_dt"))
             .withColumn("_wo_dt",     parse_date("write_off_status_dt"))

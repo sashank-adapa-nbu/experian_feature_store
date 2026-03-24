@@ -169,7 +169,7 @@ class LoanAmountExposureFeatures(TradelineFeatureBase):
         df = (
             df
             .withColumn("_closed_dt", parse_date("closed_dt"))
-            .withColumn("_as_of_dt",  parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
         )
 
         # ── STEP 2: Active / Inactive flags ──────────────────────────────────
@@ -470,7 +470,7 @@ class CreditCardLimitsFeatures(TradelineFeatureBase):
         df = (
             df
             .withColumn("_open_dt",  parse_date("open_dt"))
-            .withColumn("_as_of_dt", parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
         )
 
         # ── STEP 2: Months since account was opened ───────────────────────────
@@ -602,7 +602,7 @@ class HighestCreditSignalsFeatures(TradelineFeatureBase):
         df = (
             df
             .withColumn("_open_dt",  parse_date("open_dt"))
-            .withColumn("_as_of_dt", parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
         )
 
         # ── STEP 2: Months since open — no leakage guard ──────────────────────
@@ -823,7 +823,7 @@ class LoanVolumeOverTimeFeatures(TradelineFeatureBase):
         df = (
             df
             .withColumn("_open_dt",  parse_date("open_dt"))
-            .withColumn("_as_of_dt", parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
         )
 
         # ── STEP 2: Months since open — NULL for future accounts (no leakage) ─

@@ -11,7 +11,7 @@
 #   - No df.count() on 500M rows (removed double-materialise)
 #   - master table broadcast-joined (< 10MB) instead of shuffle-joined
 #   - Partition pruning on TRADELINE_TABLE via scrub_output_date filter
-#   - Incremental skip of already-processed dates
+#   - Incremental skip of already-processed dates (per-source: tradeline + enquiry)
 #   - Spark conf applied once at pipeline init
 # =============================================================================
 
@@ -137,23 +137,39 @@ class ScrubPipeline(BasePipeline):
         )
         return [str(r["scrub_output_date"]) for r in rows]
 
-    def _get_processed_dates(self) -> List[str]:
-        out = (f"{config.OUTPUT_CATALOG}.{config.OUTPUT_SCHEMA}."
-               f"{config.TRADELINE_FEATURE_TABLE_PREFIX}_scrub")
+    def _get_processed_tradeline_dates(self) -> set:
+        """Dates already written to the tradeline feature table."""
+        tl_table = (f"{config.OUTPUT_CATALOG}.{config.OUTPUT_SCHEMA}."
+                    f"{config.TRADELINE_FEATURE_TABLE_PREFIX}_scrub")
         try:
-            rows = (
-                self.spark.table(out)
-                .select("scrub_output_date")
-                .distinct()
-                .collect()
-            )
-            return [str(r["scrub_output_date"]) for r in rows]
+            return {
+                str(r["scrub_output_date"])
+                for r in self.spark.table(tl_table)
+                    .select("scrub_output_date").distinct().collect()
+            }
         except Exception:
-            return []
+            return set()
+
+    def _get_processed_enquiry_dates(self) -> set:
+        """Dates already written to the enquiry feature table."""
+        enq_table = (f"{config.OUTPUT_CATALOG}.{config.OUTPUT_SCHEMA}."
+                     f"{config.ENQUIRY_FEATURE_TABLE_PREFIX}_scrub")
+        try:
+            return {
+                str(r["scrub_output_date"])
+                for r in self.spark.table(enq_table)
+                    .select("scrub_output_date").distinct().collect()
+            }
+        except Exception:
+            return set()
 
     def run(self, scrub_date: str):
         """
         Run full feature pipeline for ONE scrub_output_date.
+
+        Each source (tradeline / enquiry) is checked independently —
+        if one is already written it is skipped, the other still runs.
+        This makes the pipeline safely resumable after a partial failure.
 
         Loading, computing and writing one date at a time ensures that
         only ~500M rows are in memory at any point — not 50B+.
@@ -166,20 +182,26 @@ class ScrubPipeline(BasePipeline):
 
         try:
             # ── Tradeline features ────────────────────────────────────────────
-            tl_df = self._load_tradeline(scrub_date, master)
-            # DO NOT call .count() here — triggers full scan of 500M rows
-            feats = self.run_tradeline_categories(tl_df, scrub_date)
-            if feats is not None:
-                self.write_features(feats, "tradeline", scrub_date)
-                # write_features() calls df.unpersist() in its finally block
+            if scrub_date in self._get_processed_tradeline_dates():
+                logger.info(f"  [SKIP] Tradeline already written | date={scrub_date}")
             else:
-                logger.warning(f"  No tradeline features for {scrub_date}")
+                tl_df = self._load_tradeline(scrub_date, master)
+                # DO NOT call .count() here — triggers full scan of 500M rows
+                feats = self.run_tradeline_categories(tl_df, scrub_date)
+                if feats is not None:
+                    self.write_features(feats, "tradeline", scrub_date)
+                    # write_features() calls df.unpersist() in its finally block
+                else:
+                    logger.warning(f"  No tradeline features for {scrub_date}")
 
             # ── Enquiry features ──────────────────────────────────────────────
-            enq_df = self._load_enquiry(scrub_date, master)
-            feats  = self.run_enquiry_categories(enq_df, scrub_date)
-            if feats is not None:
-                self.write_features(feats, "enquiry", scrub_date)
+            if scrub_date in self._get_processed_enquiry_dates():
+                logger.info(f"  [SKIP] Enquiry already written | date={scrub_date}")
+            else:
+                enq_df = self._load_enquiry(scrub_date, master)
+                feats  = self.run_enquiry_categories(enq_df, scrub_date)
+                if feats is not None:
+                    self.write_features(feats, "enquiry", scrub_date)
 
         finally:
             # ── LEAK FIX: unpersist broadcast master after each date ──────────
@@ -224,14 +246,29 @@ class ScrubPipeline(BasePipeline):
 
         skip_processed=True  → incremental mode (skip already-written dates)
         skip_processed=False → full reprocess (for schema changes / bug fixes)
+
+        A date is considered fully done only when BOTH tradeline AND enquiry
+        are written. If only one succeeded on a previous run, that date will
+        be re-entered and run() will skip the already-written source internally.
         """
-        all_dates  = self._get_all_scrub_dates()
-        done_dates = set(self._get_processed_dates()) if skip_processed else set()
-        pending    = [d for d in all_dates if d not in done_dates]
+        all_dates = self._get_all_scrub_dates()
+
+        if skip_processed:
+            tl_done  = self._get_processed_tradeline_dates()
+            enq_done = self._get_processed_enquiry_dates()
+            # Only skip the outer loop for dates where BOTH sources are written.
+            # Partially-done dates (one source written, other failed) are kept
+            # in pending — run() will skip the already-written source internally.
+            done_dates = tl_done & enq_done
+        else:
+            tl_done = enq_done = done_dates = set()
+
+        pending = [d for d in all_dates if d not in done_dates]
 
         logger.info(
-            f"[ScrubPipeline] Total={len(all_dates)} | Done={len(done_dates)} | "
-            f"Pending={len(pending)}"
+            f"[ScrubPipeline] Total={len(all_dates)} | "
+            f"TL written={len(tl_done)} | ENQ written={len(enq_done)} | "
+            f"Both done={len(done_dates)} | Pending={len(pending)}"
         )
 
         for i, d in enumerate(pending):
@@ -256,14 +293,30 @@ class ScrubPipeline(BasePipeline):
         """
         Process scrub dates within [start_date, end_date] inclusive.
         Useful for backfill of a specific date range without reprocessing all history.
+
+        Same per-source skip logic as run_all — a date is only excluded from
+        pending if both tradeline AND enquiry are already written.
         """
-        all_dates  = self._get_all_scrub_dates()
-        done_dates = set(self._get_processed_dates()) if skip_processed else set()
-        pending    = [
+        all_dates = self._get_all_scrub_dates()
+
+        if skip_processed:
+            tl_done  = self._get_processed_tradeline_dates()
+            enq_done = self._get_processed_enquiry_dates()
+            done_dates = tl_done & enq_done
+        else:
+            tl_done = enq_done = done_dates = set()
+
+        pending = [
             d for d in all_dates
             if start_date <= d <= end_date and d not in done_dates
         ]
-        logger.info(f"[ScrubPipeline] Date range {start_date}..{end_date} | Pending={len(pending)}")
+
+        logger.info(
+            f"[ScrubPipeline] Date range {start_date}..{end_date} | "
+            f"TL written={len(tl_done)} | ENQ written={len(enq_done)} | "
+            f"Both done={len(done_dates)} | Pending={len(pending)}"
+        )
+
         for i, d in enumerate(pending):
             logger.info(f"\n[ScrubPipeline] {i+1}/{len(pending)} | date={d}")
             try:

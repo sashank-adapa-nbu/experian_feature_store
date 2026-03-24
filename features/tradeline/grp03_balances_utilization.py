@@ -55,7 +55,7 @@ class OutstandingBalanceFeatures(TradelineFeatureBase):
             df
             .withColumn("_closed_dt",  parse_date("closed_dt"))
             .withColumn("_open_dt",    parse_date("open_dt"))
-            .withColumn("_as_of_dt",   parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
             .withColumn("_balance_dt", parse_date("balance_dt"))
         )
 
@@ -136,7 +136,7 @@ class CreditUtilizationFeatures(TradelineFeatureBase):
         df = (
             df
             .withColumn("_bal_dt",   parse_date("balance_dt"))
-            .withColumn("_as_of_dt", parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
             .withColumn("_open_dt",  parse_date("open_dt"))
             .withColumn("_closed_dt",parse_date("closed_dt"))
         )

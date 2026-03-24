@@ -123,7 +123,7 @@ class CreditEnquiriesFeatures(EnquiryFeatureBase):
         df = (
             df
             .withColumn("_inq_dt",   parse_date("inq_date"))
-            .withColumn("_as_of_dt", parse_date(as_of_col))
+            .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
         )
 
         # ── STEP 2: Months since enquiry (no leakage — only inq_date <= as_of) ─

@@ -71,36 +71,36 @@ def parse_date(col_name: str) -> Column:
 
     return F.coalesce(
         # ── 1. Experian standard (Indian format) ─────────────────────────────
-        F.to_date(c, "dd/MM/yyyy"),
+        F.try_to_date(c, "dd/MM/yyyy"),
 
         # ── 2. ISO date (enquiry table, partition columns, scrub_output_date) ─
-        F.to_date(c, "yyyy-MM-dd"),
+        F.try_to_date(c, "yyyy-MM-dd"),
 
         # ── 3. Indian hyphen variant ──────────────────────────────────────────
-        F.to_date(c, "dd-MM-yyyy"),
+        F.try_to_date(c, "dd-MM-yyyy"),
 
         # ── 4. Slash ISO ──────────────────────────────────────────────────────
-        F.to_date(c, "yyyy/MM/dd"),
+        F.try_to_date(c, "yyyy/MM/dd"),
 
         # ── 5. Compact numeric ────────────────────────────────────────────────
-        F.to_date(c, "yyyyMMdd"),
+        F.try_to_date(c, "yyyyMMdd"),
 
         # ── 6. ISO datetime with timezone offset (+00:00, +05:30 etc.) ───────
-        F.to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
+        F.try_to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
 
         # ── 7. ISO datetime with Z suffix ────────────────────────────────────
-        F.to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
+        F.try_to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
 
         # ── 8. ISO datetime with milliseconds, no tz ─────────────────────────
-        F.to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSS"),
+        F.try_to_date(c, "yyyy-MM-dd'T'HH:mm:ss.SSS"),
 
         # ── 9. ISO datetime, no milliseconds ─────────────────────────────────
-        F.to_date(c, "yyyy-MM-dd'T'HH:mm:ss"),
+        F.try_to_date(c, "yyyy-MM-dd'T'HH:mm:ss"),
 
         # ── 10. Space-separated datetime ──────────────────────────────────────
-        F.to_date(c, "yyyy-MM-dd HH:mm:ss"),
+        F.try_to_date(c, "yyyy-MM-dd HH:mm:ss"),
 
         # ── 11. US format — defensive fallback only ───────────────────────────
         # Placed last to avoid ambiguity with dd/MM/yyyy for day <= 12
-        F.to_date(c, "MM/dd/yyyy"),
+        F.try_to_date(c, "MM/dd/yyyy"),
     )
