@@ -55,7 +55,10 @@ class DelinquencyDPDFeatures(TradelineFeatureBase):
 
         df = (
             df
-            .withColumn("_rpt_dt",    parse_date("last_reporting_pymt_dt"))
+            .withColumn("_rpt_dt", F.coalesce(
+                                   parse_date("last_reporting_pymt_dt"),
+                                   parse_date("balance_dt"),
+                               ))
             .withColumn("_as_of_dt", F.col(as_of_col).cast("date"))
             .withColumn("_open_dt",   parse_date("open_dt"))
             .withColumn("_closed_dt", parse_date("closed_dt"))

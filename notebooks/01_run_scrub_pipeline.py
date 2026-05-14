@@ -24,7 +24,6 @@
 #   leaves all previously processed dates intact and can resume from that date.
 #
 # Schedule example (Databricks Jobs UI):
-#   Trigger  : Every Sunday 02:00 AM
 #   Parameter: scrub_output_date = ALL
 # =============================================================================
 

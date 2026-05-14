@@ -18,7 +18,7 @@ from core.utils import build_history_array, resolve_slot, resolve_slot_at_asof
 logger = get_logger(__name__)
 
 N_BAL = 36
-N_PMT = 12    # obligations only needs 12m payment history
+N_PMT = 36   # obligations only needs 12m payment history
 
 BAL_HIST = [f"balance_am_{str(i).zfill(2)}"        for i in range(1, N_BAL + 1)]
 PMT_HIST = [f"actual_payment_am_{str(i).zfill(2)}" for i in range(1, N_PMT + 1)]

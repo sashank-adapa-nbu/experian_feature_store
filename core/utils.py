@@ -130,12 +130,14 @@ def resolve_slot(arr_col: str, k: int, md_col: str = "_md",
                  product_filter=None) -> F.Column:
     """
     Resolve value at window offset k from as_of_dt using array indexing.
-
+ 
     slot_idx = k - _md   (where _md = ceil(months_between(as_of_dt, report_dt)))
     Spark arrays are 1-based → index = slot_idx + 1.
-    slot < 0 (gap) → NULL.
-    slot > N (beyond history) → NULL (element_at returns NULL automatically).
-
+    slot < 0 (gap)             → NULL  (lower bound guard)
+    slot > array_size          → NULL  (upper bound guard — required for retro
+                                         data where report_dt > as_of_dt can
+                                         push idx past array end)
+ 
     Parameters
     ----------
     arr_col        : Name of the pre-built array column
@@ -146,10 +148,10 @@ def resolve_slot(arr_col: str, k: int, md_col: str = "_md",
     slot_idx  = F.lit(k) - F.col(md_col)
     idx1based = (slot_idx + F.lit(1)).cast("int")
     val = F.when(
-        slot_idx >= 0,
+        (slot_idx >= 0) & (idx1based <= F.size(F.col(arr_col))),
         F.element_at(F.col(arr_col), idx1based)
     ).otherwise(F.lit(None).cast("double"))
-
+ 
     if product_filter is not None:
         val = F.when(product_filter, val).otherwise(F.lit(None).cast("double"))
     return val
