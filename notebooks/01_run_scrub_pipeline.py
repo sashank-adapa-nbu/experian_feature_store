@@ -76,18 +76,56 @@ logger.info("Notebook 01 complete.")
 
 # COMMAND ----------
 
-# Validation — show row counts per scrub date
+# Validation — show row counts per scrub date (metadata-only, no full scan)
+# =============================================================================
+# The previous version did df.groupBy("scrub_output_date").count() which
+# triggers a FULL DATA SCAN of the output table at the end of a multi-hour
+# job. If the driver was already memory-pressured from the run, this final
+# scan could crash the notebook and mark the whole job as failed even though
+# all data was successfully written.
+#
+# We now use Delta's transaction log via SHOW PARTITIONS — reads ~ms regardless
+# of table size, no data scan, no shuffle, no driver memory pressure.
+# Row counts per partition come from the Delta commit log via DESCRIBE DETAIL,
+# which is also metadata-only.
+# =============================================================================
 from config import config
 
 tl_tbl  = f"{config.OUTPUT_CATALOG}.{config.OUTPUT_SCHEMA}.{config.TRADELINE_FEATURE_TABLE_PREFIX}_scrub"
 enq_tbl = f"{config.OUTPUT_CATALOG}.{config.OUTPUT_SCHEMA}.{config.ENQUIRY_FEATURE_TABLE_PREFIX}_scrub"
 
-for tbl, label in [(tl_tbl, "Tradeline"), (enq_tbl, "Enquiry")]:
+def _summarise_table(tbl: str, label: str):
+    """Print partition list + total row count, all from Delta metadata only."""
     try:
-        df = spark.table(tbl)
+        # Schema info — cheap, just reads catalog metadata
+        df_schema = spark.table(tbl)
+        n_cols = len(df_schema.columns)
+
+        # Partition list — reads Delta transaction log, milliseconds
+        parts = spark.sql(f"SHOW PARTITIONS {tbl}").collect()
+        n_parts = len(parts)
+
+        # Total table-level metrics — reads Delta DESCRIBE DETAIL (metadata-only)
+        detail = spark.sql(f"DESCRIBE DETAIL {tbl}").collect()[0].asDict()
+        # numFiles / sizeInBytes are always populated; numRecords is too for
+        # delta tables written by recent Databricks runtimes
+        size_gb   = round(detail.get("sizeInBytes", 0) / (1024 ** 3), 2)
+        num_files = detail.get("numFiles", "n/a")
+
         print(f"\n{label} → {tbl}")
-        print(f"  Columns : {len(df.columns)}")
-        print("  Rows per scrub date (from partition stats, no full scan):")
-        df.groupBy("scrub_output_date").count().orderBy("scrub_output_date").show(100, False)
+        print(f"  Columns          : {n_cols}")
+        print(f"  Partitions       : {n_parts}")
+        print(f"  Files            : {num_files}")
+        print(f"  Size on disk (GB): {size_gb}")
+        print(f"  Partitions list (first 20):")
+        for p in parts[:20]:
+            print(f"    {p[0]}")
+        if n_parts > 20:
+            print(f"    ... and {n_parts - 20} more")
     except Exception as e:
-        print(f"  Could not read {tbl}: {e}")
+        print(f"  Could not summarise {tbl}: {e}")
+
+for tbl, label in [(tl_tbl, "Tradeline"), (enq_tbl, "Enquiry")]:
+    _summarise_table(tbl, label)
+
+

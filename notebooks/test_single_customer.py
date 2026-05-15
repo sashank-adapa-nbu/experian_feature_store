@@ -74,7 +74,7 @@ print(f"party_code         : {PARTY_CODE}")
 
 tl_df = tl_raw.join(master, on="customer_scrub_key", how="left")
 
-PK_COLS   = ["customer_scrub_key", "party_code", "scrub_output_date"]
+PK_COLS   = ["customer_scrub_key", "party_code"]
 AS_OF_COL = "scrub_output_date"
 
 # COMMAND ----------
