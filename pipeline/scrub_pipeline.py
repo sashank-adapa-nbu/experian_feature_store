@@ -79,6 +79,10 @@ TRADELINE_USED_COLS: List[str] = [
     "emi",
     "suit_filed_willful_dflt",
     "written_off_and_settled_status",
+    "total_write_off_am_4in",
+    "principal_write_off_am_4in",
+    "settled_am_4in",
+
 ]
 # Append history columns 01..36 for each prefix
 for _prefix in _TRADELINE_HISTORY_PREFIXES:

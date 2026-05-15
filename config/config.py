@@ -13,7 +13,7 @@ TRADELINE_FEATURE_TABLE_PREFIX = "experian_tradeline_features"
 ENQUIRY_FEATURE_TABLE_PREFIX   = "experian_enquiry_features"
 
 # ── Primary Key Columns ───────────────────────────────────────────────────────
-SCRUB_PK_COLS  = ["customer_scrub_key", "party_code", "scrub_output_date"]
+SCRUB_PK_COLS  = ["customer_scrub_key"]
 RETRO_PK_COLS  = ["party_code", "reference_dt"]
 
 # ── Key Column Names ──────────────────────────────────────────────────────────

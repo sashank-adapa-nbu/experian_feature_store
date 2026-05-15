@@ -114,21 +114,24 @@ class BasePipeline(ABC):
         # DataFrame then has two columns with the same name — Delta refuses
         # to write that schema (COLUMN_ALREADY_EXISTS). Dedup here, preserving
         # the order of first occurrence.
-        seen_keys = set()
-        join_cols: List[str] = []
-        for c in pk_cols + [as_of_col]:
-            if c not in seen_keys:
-                join_cols.append(c)
-                seen_keys.add(c)
+        # seen_keys = set()
+        # join_cols: List[str] = []
+        # for c in pk_cols + [as_of_col]:
+        #     if c not in seen_keys:
+        #         join_cols.append(c)
+        #         seen_keys.add(c)
 
-        # Build a deduplicated pk_cols WITHOUT as_of_col to pass to each
-        # compute(). Each grp's compute() does `group_cols = pk_cols + [as_of_col]`
-        # then groupBy(group_cols). If pk_cols already contains as_of_col,
-        # groupBy gets a duplicate name and the result DataFrame has two
-        # columns with the same name — Delta refuses to write that.
-        # Grouping keys are mathematically identical:
-        #   groupBy(["a","b","x"] + ["x"]) == groupBy(["a","b","x"])
-        pk_cols_clean = [c for c in pk_cols if c != as_of_col]
+        # # Build a deduplicated pk_cols WITHOUT as_of_col to pass to each
+        # # compute(). Each grp's compute() does `group_cols = pk_cols + [as_of_col]`
+        # # then groupBy(group_cols). If pk_cols already contains as_of_col,
+        # # groupBy gets a duplicate name and the result DataFrame has two
+        # # columns with the same name — Delta refuses to write that.
+        # # Grouping keys are mathematically identical:
+        # #   groupBy(["a","b","x"] + ["x"]) == groupBy(["a","b","x"])
+        # pk_cols_clean = [c for c in pk_cols if c != as_of_col]
+
+        join_cols     = list(pk_cols)          # ["customer_scrub_key"]
+        pk_cols_clean = list(pk_cols)          # ["customer_scrub_key"]
 
         logger.info(f"[{self.get_mode_suffix()}] {len(feature_classes)} {source} groups | batch={batch_key}")
 
@@ -217,10 +220,11 @@ class BasePipeline(ABC):
             )
             logger.info(f"  [join] +{cat_name} | total_cols={len(base_df.columns)}")
 
-        # ── STEP 4: Final-result dedup + date-type enforcement ────────────────
-        # Same guards as before — protect against duplicate column names that
-        # somehow survived (e.g. two groups returning the same feature) and
-        # against Catalyst widening DateType → StringType across the join chain.
+        # ── STEP 4: Final-result dedup ────────────────────────────────────────
+        # Protect against duplicate column names that somehow survived.
+        # NOTE: date-type re-cast is done AFTER the pk re-attach join in
+        # STEP 5, so scrub_output_date is enforced once at the very end
+        # (casting here then joining would let Catalyst widen it again).
         seen = set()
         final_cols = []
         for c in base_df.columns:
@@ -231,14 +235,67 @@ class BasePipeline(ABC):
             logger.warning(f"  Dropped {len(base_df.columns)-len(final_cols)} duplicate column(s) after join")
             base_df = base_df.select(final_cols)
 
-        # Re-cast date columns to DateType after long join chain.
-        # Catalyst can widen DateType → StringType when resolving column names
-        # across many chained joins; this enforcement keeps Delta happy.
+        # ── STEP 5: Re-attach party_code + scrub_output_date ─────────────────
+        # groupBy used only customer_scrub_key (the repartition key) so every
+        # aggregation above was a local, shuffle-free operation. Now we need
+        # the full primary-key columns (customer_scrub_key, party_code,
+        # scrub_output_date) on the final output for Delta writes and
+        # downstream consumers.
+        #
+        # party_code and scrub_output_date are available on the raw source df
+        # (one distinct pair per customer_scrub_key by construction —
+        # customer_scrub_key = hash(party_code, scrub_output_date)).
+        # We pull a tiny lookup (3 cols, one row per customer) from the already-
+        # persisted source and broadcast-join it so there is NO extra shuffle.
+        pk_lookup_cols = [config.CUSTOMER_SCRUB_KEY_COL,
+                          config.PARTY_CODE_COL,
+                          config.SCRUB_OUTPUT_DATE_COL]
+        # Only run this for sources that carry all three columns
+        # (tradeline + enquiry both do; guard defensively)
+        missing_lookup = [c for c in pk_lookup_cols if c not in df.columns]
+        if not missing_lookup:
+            pk_lookup = (
+                df
+                .select(pk_lookup_cols)
+                .distinct()                          # tiny: one row per csk
+            )
+            # Drop any of these cols that already snuck onto base_df
+            # (shouldn't happen, but guards against future compute() changes)
+            for c in [config.PARTY_CODE_COL, config.SCRUB_OUTPUT_DATE_COL]:
+                if c in base_df.columns:
+                    base_df = base_df.drop(c)
+
+            base_df = base_df.join(
+                F.broadcast(pk_lookup),
+                on=config.CUSTOMER_SCRUB_KEY_COL,
+                how="left",
+            )
+
+            # Reorder so PK cols come first, then all feature cols
+            pk_first = pk_lookup_cols + [
+                c for c in base_df.columns if c not in pk_lookup_cols
+            ]
+            base_df = base_df.select(pk_first)
+
+            logger.info(
+                f"  [pk-reattach] added party_code + scrub_output_date | "
+                f"total_cols={len(base_df.columns)}"
+            )
+        else:
+            logger.warning(
+                f"  [pk-reattach] skipped — source missing cols: {missing_lookup}"
+            )
+
+        # ── Date-type enforcement (after ALL joins are done) ──────────────────
+        # Re-cast here rather than in STEP 4 so scrub_output_date picked up
+        # from pk_lookup is also correctly typed. Catalyst can widen DateType
+        # → StringType across join chains; this single enforcement at the end
+        # keeps Delta happy regardless of join order.
         for col_name in self._DATE_COLS:
             if col_name in base_df.columns:
                 base_df = base_df.withColumn(col_name, F.col(col_name).cast("date"))
 
-        # ── STEP 5: Attach source-handle for cleanup after write ──────────────
+        # ── STEP 6: Attach source-handle for cleanup after write ──────────────
         # We can't unpersist df here because base_df still references it
         # transitively through the broadcast-joined plan. The actual unpersist
         # happens in write_features() after the final write triggers execution.

@@ -197,7 +197,7 @@ class LenderTypeMixFeatures(TradelineFeatureBase):
 
     def compute(self, df: DataFrame, pk_cols: List[str], as_of_col: str) -> DataFrame:
         self._log_start(mode="dynamic", date="batch")
-        group_cols = pk_cols + [as_of_col]
+        group_cols = pk_cols
 
 
         df = (
